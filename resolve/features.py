@@ -85,6 +85,8 @@ def engineer_name_features(df):
 
         for _, row in df.iterrows():
             similarities = calculate_string_similarity(row[mention_col], row[post_col])
+
+            print(f"Similarities {similarities}")
             features[f"{name_part}_name_jaro"].append(similarities["jaro_winkler"])
             features[f"{name_part}_name_levenshtein"].append(
                 similarities["levenshtein_norm"]

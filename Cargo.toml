@@ -1,0 +1,21 @@
+[package]
+name = "features"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+polars = { version = "0.35", features = ["lazy", "csv", "json", "parquet", "dtype-datetime"] }
+rayon = "1.8"
+rust-bert = "0.23"
+tch = "0.17"
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.0", features = ["full"] }
+
+# Python integration for exact jellyfish compatibility
+pyo3 = { version = "0.21", features = ["auto-initialize"] }
+
+[[bin]]
+name = "features"
+path = "src/main.rs"

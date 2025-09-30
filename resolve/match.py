@@ -4,8 +4,9 @@ import pickle
 import datetime
 from api import NPIClient
 
-from features import featurize
+from features_rust import featurize
 from models.src import OfficerMention
+# from features import featurize
 
 # TODO we should be matching on agency name? quizas
 
@@ -228,7 +229,7 @@ class PostMatcher:
 if __name__ == "__main__":
     print("\nDEBUG: Starting matching process...")
 
-    input_df = pd.read_csv("data/input/df_lapd_short_ma.csv")
+    input_df = pd.read_csv("data/input/test.csv")
     print(input_df)
     print(f"\nDEBUG: Read {len(input_df)} records from input CSV")
     print("\nDEBUG: Input data sample:")
