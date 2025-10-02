@@ -116,6 +116,19 @@ async def get_candidates_for_mention(
         raise HTTPException(
             status_code=500, detail=f"Failed to get candidates: {str(e)}"
         )
+    
+@app.get("/post/agency/county")
+async def get_county_for_agency(
+    agency_name: str = Query(..., description="Agency name to lookup")
+):
+    """Get the county for a given agency name"""
+    try:
+        county = db_client.get_county_for_agency(agency_name)
+        return {"agency_name": agency_name, "county": county}
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, detail=f"Failed to get county for agency: {str(e)}"
+        )
 
 
 if __name__ == "__main__":

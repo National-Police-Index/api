@@ -36,7 +36,7 @@ class SupabaseClient:
             end_date = None
 
         return PostEmploymentRecord(
-            post_person_nbr=record.get("post_uid", ""),
+            post_person_nbr=record.get("person_nbr", ""),
             post_first_name=record.get("first_name", ""),
             post_middle_name=record.get("middle_name", ""),
             post_last_name=record.get("last_name", ""),
@@ -47,6 +47,7 @@ class SupabaseClient:
             post_end_date=end_date,
             post_separation_reason=record.get("separation_reason", ""),
             state=record.get("state", ""),
+            county=record.get("county", ""),
         )
 
     def get_post_employment_records(
@@ -62,7 +63,7 @@ class SupabaseClient:
             List of PostEmploymentRecord models
         """
         # Start with base query selecting all columns from post table
-        query = self.supabase.table("post").select("*")
+        query = self.supabase.table("testing").select("*")
 
         # Apply filters
         query = self._apply_filters(query, query_params)
@@ -88,35 +89,79 @@ class SupabaseClient:
         self, query_params: Optional[CandidateQuery] = None
     ) -> int:
         """Get total count of POST employment records with optional filters"""
-        query = self.supabase.table("post").select("post_uid", count="exact")
+        query = self.supabase.table("testing").select("person_nbr", count="exact")
 
         if query_params:
             query = self._apply_filters(query, query_params)
 
         response = query.execute()
         return response.count or 0
+    
+    def get_county_for_agency(self, agency_name: str) -> Optional[str]:
+        """
+        Get the county for a given agency name.
+        For county sheriff agencies, matches both Office and Department variants.
+        Returns the first matching county found, or None if agency not found.
+        """
+        if not agency_name:
+            return None
+        
+        # First try exact match
+        response = (
+            self.supabase.table("testing")
+            .select("county")
+            .ilike("agency_name", f"%{agency_name}%")
+            .limit(1)
+            .execute()
+        )
+        
+        if response.data and len(response.data) > 0:
+            return response.data[0].get("county")
+        
+        # If no match and it's a county sheriff agency, try swapping office/department
+        normalized = agency_name.lower()
+        if "county sheriff" in normalized:
+            if "office" in normalized:
+                alternate_name = agency_name.replace("Office", "Department").replace("office", "department")
+            elif "department" in normalized:
+                alternate_name = agency_name.replace("Department", "Office").replace("department", "office")
+            else:
+                return None
+            
+            response = (
+                self.supabase.table("testing")
+                .select("county")
+                .ilike("agency_name", f"%{alternate_name}%")
+                .limit(1)
+                .execute()
+            )
+            
+            if response.data and len(response.data) > 0:
+                return response.data[0].get("county")
+        
+        return None
 
     def get_post_stats(self) -> Dict[str, Any]:
         """Get POST employment statistics"""
 
         # Total employment records
         total_response = (
-            self.supabase.table("post").select("post_uid", count="exact").execute()
+            self.supabase.table("testing").select("person_nbr", count="exact").execute()
         )
         total_records = total_response.count or 0
 
         # Unique officers (distinct post_uid)
-        officers_response = self.supabase.table("post").select("post_uid").execute()
+        officers_response = self.supabase.table("testing").select("person_nbr").execute()
         unique_officers = len(
             set(
-                record.get("post_uid")
+                record.get("person_nbr")
                 for record in officers_response.data
-                if record.get("post_uid")
+                if record.get("person_nbr")
             )
         )
 
         # Unique agencies
-        agencies_response = self.supabase.table("post").select("agency_name").execute()
+        agencies_response = self.supabase.table("testing").select("agency_name").execute()
         unique_agencies = len(
             set(
                 record.get("agency_name")
@@ -126,7 +171,7 @@ class SupabaseClient:
         )
 
         # Unique states
-        states_response = self.supabase.table("post").select("state").execute()
+        states_response = self.supabase.table("testing").select("state").execute()
         unique_states = len(
             set(
                 record.get("state")
@@ -137,8 +182,8 @@ class SupabaseClient:
 
         # Active officers (no end date or end date is None/null)
         active_response = (
-            self.supabase.table("post")
-            .select("post_uid", count="exact")
+            self.supabase.table("testing")
+            .select("person_nbr", count="exact")
             .is_("end_date", "null")
             .execute()
         )
@@ -146,8 +191,8 @@ class SupabaseClient:
 
         # Separated officers (has end date)
         separated_response = (
-            self.supabase.table("post")
-            .select("post_uid", count="exact")
+            self.supabase.table("testing")
+            .select("person_nbr", count="exact")
             .not_.is_("end_date", "null")
             .execute()
         )
@@ -192,7 +237,7 @@ class SupabaseClient:
     ) -> List[PostEmploymentRecord]:
         """Get all employment records for a specific person number"""
         response = (
-            self.supabase.table("post").select("*").eq("post_uid", person_nbr).execute()
+            self.supabase.table("testing").select("*").eq("person_nbr", person_nbr).execute()
         )
 
         return [self._transform_record(record) for record in response.data]
@@ -210,7 +255,7 @@ class SupabaseClient:
             base_filters.append(("state", "ilike", f"%{query_params.state}%"))
 
         # Query 1: first name prefix + exact last name
-        query1 = self.supabase.table("post").select("*")
+        query1 = self.supabase.table("testing").select("*")
         if query_params.first_name and len(query_params.first_name) >= 2:
             query1 = query1.ilike("first_name", f"{query_params.first_name[:2]}%")
         if query_params.last_name:
@@ -221,7 +266,7 @@ class SupabaseClient:
             query1 = query1.ilike(field, value)
 
         # Query 2: exact first name + last name prefix
-        query2 = self.supabase.table("post").select("*")
+        query2 = self.supabase.table("testing").select("*")
         if query_params.first_name:
             query2 = query2.eq("first_name", query_params.first_name)
         if query_params.last_name and len(query_params.last_name) >= 2:
@@ -242,7 +287,7 @@ class SupabaseClient:
 
         for record in all_results:
             key = (
-                record.get("post_uid"),
+                record.get("person_nbr"),
                 record.get("start_date"),
                 record.get("end_date"),
                 record.get("agency_name"),

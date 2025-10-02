@@ -23,7 +23,8 @@ class PostEmploymentRecord(BaseModel):
     post_end_date: Optional[datetime] = None
     post_separation_reason: Optional[str] = None
     state: Optional[str] = None
-
+    county: Optional[str] = None  
+    
 
 class OfficerMention(BaseModel):
     """Officer mention from incident reports"""
@@ -31,7 +32,7 @@ class OfficerMention(BaseModel):
     mention_uid: str
     mention_agency_type: AgencyType = AgencyType.POLICE
     mention_incident_date: date
-    mention_first_name: Optional[str] = None
+    mention_first_name: str = None
     mention_middle_name: Optional[str] = None
     mention_suffix: Optional[str] = None
     mention_last_name: str

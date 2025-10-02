@@ -134,6 +134,30 @@ class NPIClient:
         except requests.exceptions.RequestException as e:
             logger.error(f"Failed to get candidates from dedicated endpoint: {e}")
             return []
+        
+    def get_county_for_agency(self, agency_name: str) -> Optional[str]:
+        """
+        Get the county for a given agency name.
+        
+        Args:
+            agency_name: Name of the agency to lookup
+            
+        Returns:
+            County name or None if not found
+        """
+        try:
+            params = {"agency_name": agency_name}
+            response = self.session.get(
+                f"{self.base_url}/post/agency/county",
+                params=params,
+                timeout=self.timeout
+            )
+            response.raise_for_status()
+            data = response.json()
+            return data.get("county")
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Failed to get county for agency: {e}")
+            return None
 
     def get_all_post_employment_records(
         self, batch_size: int = 1000, state: Optional[str] = None

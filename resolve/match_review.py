@@ -6,6 +6,7 @@ from api import NPIClient
 
 from features_rust import featurize
 from models.src import OfficerMention
+from concurrent.futures import ThreadPoolExecutor, as_completed
 # from features import featurize
 
 # TODO we should be matching on agency name? quizas
@@ -214,7 +215,12 @@ class PostMatcher:
     ) -> tuple[pd.DataFrame, pd.DataFrame]:
         """for a list of mentions, return the most likely matching stint from the post employment history
         Also returns all candidates with their scores for debugging"""
-        candidates = pd.concat(generate_candidates(mention) for mention in mentions)
+        # candidates = pd.concat(generate_candidates(mention) for mention in mentions)
+
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            candidate_dfs = list(executor.map(generate_candidates, mentions))
+            
+        candidates = pd.concat(candidate_dfs)
 
         # Get probabilities instead of just predictions
         # model = self._logistic_model()
@@ -227,7 +233,7 @@ class PostMatcher:
         candidates["match_probability"] = probabilities[:, 1]
 
         # For each mention_uid, keep only the highest probability match
-        best_matches = candidates[candidates["match_probability"] > 0.4].sort_values(
+        best_matches = candidates[candidates["match_probability"] > 0.5].sort_values(
             "match_probability", ascending=False
         )
         best_matches = best_matches.drop_duplicates(subset="mention_uid", keep="first")
@@ -257,7 +263,7 @@ if __name__ == "__main__":
 
     input_df = pd.read_csv("data/input/sample.csv")
 
-    input_df = input_df.head(10)
+    # input_df = input_df.head(10)
     print(input_df)
     print(f"\nDEBUG: Read {len(input_df)} records from input CSV")
     print("\nDEBUG: Input data sample:")
@@ -308,6 +314,8 @@ if __name__ == "__main__":
                     "post_middle_name",
                     "post_last_name",
                     "post_agency_name", 
+                    "post_start_date", 
+                    "post_end_date",  
                 ]
             ],
             left_on="officer_uid",
@@ -329,24 +337,26 @@ if __name__ == "__main__":
         output_df["post_middle_name"] = None
         output_df["post_last_name"] = None
         output_df["post_agency_name"] = None
+        output_df["post_start_date"] = None     
+        output_df["post_end_date"] = None     
 
     column_order = [
         # Original officer info
-        "officer_uid",
         "first_name",
         "middle_name",
         "last_name",
+        "source_agency",
+        "incident_year",
         # POST match info
         "post_uid",
         "post_first_name",
         "post_middle_name",
         "post_last_name",
         "post_agency_name",
+        "post_start_date",       
+        "post_end_date",   
         # Other info
-        "source_agency",
-        "agency_type",
-        "incident_year",
-        "separation_reason",
+        "provisional_case_name",       
     ]
 
     remaining_cols = [col for col in output_df.columns if col not in column_order]
