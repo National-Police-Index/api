@@ -39,6 +39,7 @@ class OfficerMention(BaseModel):
     mention_rank: Optional[str] = None
     mention_agency: Optional[str] = None
     state: Optional[str] = None
+    mentioned_agencies: Optional[str] = ""
 
 
 class EntityMatch(BaseModel):

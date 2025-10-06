@@ -5,11 +5,15 @@ from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.preprocessing import MinMaxScaler
 import jellyfish
 import logging
+import pickle
 
 logger = logging.getLogger("idonea." + __name__)
 
 sentence_transformer_model = None
 
+SCALER_PATH = "models/features_scaler.pkl"
+with open(SCALER_PATH, 'rb') as f:
+    TRAINED_SCALER = pickle.load(f)
 
 def calculate_string_similarity(str1, str2):
     """Calculate various string similarity metrics."""
@@ -84,22 +88,31 @@ def engineer_name_features(df):
         features[f"{name_part}_name_length_ratio"] = []
 
         for _, row in df.iterrows():
-            similarities = calculate_string_similarity(row[mention_col], row[post_col])
-
-            print(f"Similarities {similarities}")
-            features[f"{name_part}_name_jaro"].append(similarities["jaro_winkler"])
-            features[f"{name_part}_name_levenshtein"].append(
-                similarities["levenshtein_norm"]
-            )
-            features[f"{name_part}_name_length_ratio"].append(
-                similarities["length_ratio"]
-            )
+            # Special handling for middle names - use neutral values if either is missing
+            if name_part == "middle" and (pd.isna(row[mention_col]) or pd.isna(row[post_col])):
+                features[f"{name_part}_name_jaro"].append(0.5)
+                features[f"{name_part}_name_levenshtein"].append(0.5)
+                features[f"{name_part}_name_length_ratio"].append(0.5)
+            else:
+                similarities = calculate_string_similarity(row[mention_col], row[post_col])
+                print(f"Similarities {similarities}")
+                features[f"{name_part}_name_jaro"].append(similarities["jaro_winkler"])
+                features[f"{name_part}_name_levenshtein"].append(
+                    similarities["levenshtein_norm"]
+                )
+                features[f"{name_part}_name_length_ratio"].append(
+                    similarities["length_ratio"]
+                )
 
         # Embedding-based similarity
         features[f"{name_part}_name_embedding"] = []
         for _, row in df.iterrows():
-            sim = calculate_embedding_similarity(row[mention_col], row[post_col], model)
-            features[f"{name_part}_name_embedding"].append(sim)
+            # Special handling for middle names - use neutral value if either is missing
+            if name_part == "middle" and (pd.isna(row[mention_col]) or pd.isna(row[post_col])):
+                features[f"{name_part}_name_embedding"].append(0.5)
+            else:
+                sim = calculate_embedding_similarity(row[mention_col], row[post_col], model)
+                features[f"{name_part}_name_embedding"].append(sim)
 
     print("Processing full names...")
     mention_full_names = []
@@ -173,28 +186,15 @@ def engineer_name_features(df):
 
 
 def normalize_features(df):
-    """Normalize numerical features to [0,1] range."""
-    scaler = MinMaxScaler()
-
-    # Get all features that need scaling
+    """Normalize numerical features using the pre-fitted scaler from training."""
     features_to_scale = [
-        col
-        for col in df.columns
+        col for col in df.columns
         if any(x in col for x in ["jaro", "levenshtein", "length_ratio", "embedding"])
     ]
 
-    print("\nBefore normalization (first row):")
-    for col in features_to_scale:
-        print(f"{col}: {df[col].iloc[0]}")
-
-    # Apply scaling to all features together, not grouped by metric type
-    if features_to_scale: 
-        df[features_to_scale] = scaler.fit_transform(df[features_to_scale])
-
-    print("\nAfter normalization (first row):")
-    for col in features_to_scale:
-        print(f"{col}: {df[col].iloc[0]}")
-
+    # Use transform (not fit_transform) with the saved scaler
+    df[features_to_scale] = TRAINED_SCALER.transform(df[features_to_scale])
+    
     return df
 
 

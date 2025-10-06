@@ -4,12 +4,17 @@ import pickle
 import datetime
 from api import NPIClient
 
-from features_rust import featurize
+# from features_rust import featurize
 from models.src import OfficerMention
 from concurrent.futures import ThreadPoolExecutor, as_completed
-# from features import featurize
+from features import featurize
+from helpers import validate_agency_match
 
 # TODO we should be matching on agency name? quizas
+## 2 things to do:
+# 1) if no county is found, then gen candidates over entire table,
+# if two different person nbrs have the same name / same proba, we flag for automatic review
+
 
 def generate_candidates(mention: OfficerMention) -> pd.DataFrame:
     """for a given mention, return a list of possibly matching stints from the post employment history"""
@@ -19,14 +24,19 @@ def generate_candidates(mention: OfficerMention) -> pd.DataFrame:
 
     print(f"\nDEBUG: Processing mention: {mention}")
     print(f"DEBUG: Incident year: {incident_year}")
+    print(f"DEBUG: Agency type: {mention.mention_agency_type}")
 
     client = NPIClient(base_url="http://localhost:8000")
 
     source_county = None
-    if mention.mention_agency:
+    # Only look up county for non-CORRECTIONS agencies
+    if mention.mention_agency and mention.mention_agency_type.upper() != "CORRECTIONS":
         source_county = client.get_county_for_agency(mention.mention_agency)
-        print(f"DEBUG: Source agency '{mention.mention_agency}' is in county: {source_county}")
-
+        print(
+            f"DEBUG: Source agency '{mention.mention_agency}' is in county: {source_county}"
+        )
+    elif mention.mention_agency_type.upper() == "CORRECTIONS":
+        print(f"DEBUG: CORRECTIONS agency type - skipping county lookup")
 
     print(f"first_name: {mention.mention_first_name}")
     print(f"last_name: {mention.mention_last_name}")
@@ -36,12 +46,13 @@ def generate_candidates(mention: OfficerMention) -> pd.DataFrame:
         f"DEBUG: Fetching targeted candidates for: {mention.mention_first_name} {mention.mention_last_name}"
     )
 
-    ## TODO: should we gen w fuzzy on ln?
+    # Pass agency_type to the API call
     api_candidates = client.get_candidates_for_mention(
         first_name=mention.mention_first_name,
         last_name=mention.mention_last_name,
         incident_year=mention.mention_incident_date.year,
         state=mention.state,
+        agency_type=mention.mention_agency_type,
     )
 
     if not api_candidates:
@@ -53,22 +64,34 @@ def generate_candidates(mention: OfficerMention) -> pd.DataFrame:
     print(f"DEBUG: Retrieved {len(post)} candidates from API")
     print(post)
 
-    if source_county:
+    # Only apply county filtering for non-CORRECTIONS agencies
+    if source_county and mention.mention_agency_type.upper() != "CORRECTIONS":
         print(f"DEBUG: Filtering candidates by county: {source_county}")
         # Group by post_person_nbr and check if they have ANY record in the source county
-        person_has_county_match = post.groupby('post_person_nbr')['county'].apply(
+        person_has_county_match = post.groupby("post_person_nbr")["county"].apply(
             lambda counties: source_county in counties.values
         )
-        valid_person_nbrs = person_has_county_match[person_has_county_match].index.tolist()
-        
-        print(f"DEBUG: Found {len(valid_person_nbrs)} unique officers with employment in {source_county} county")
-        post = post[post['post_person_nbr'].isin(valid_person_nbrs)]
-        print(f"DEBUG: After county filtering: {len(post)} candidate records remain")
-        
-        if len(post) == 0:
-            print(f"DEBUG: No candidates found with employment history in {source_county} county")
-            return pd.DataFrame()
+        valid_person_nbrs = person_has_county_match[
+            person_has_county_match
+        ].index.tolist()
 
+        print(
+            f"DEBUG: Found {len(valid_person_nbrs)} unique officers with employment in {source_county} county"
+        )
+        post = post[post["post_person_nbr"].isin(valid_person_nbrs)]
+        print(f"DEBUG: After county filtering: {len(post)} candidate records remain")
+
+        if len(post) == 0:
+            print(
+                f"DEBUG: No candidates found with employment history in {source_county} county"
+            )
+            return pd.DataFrame()
+    elif mention.mention_agency_type.upper() == "CORRECTIONS":
+        print(
+            f"DEBUG: CORRECTIONS agency - skipping county filtering, keeping all {len(post)} candidates"
+        )
+
+    # Rest of the function stays the same...
     agency_type = (
         post.post_agency_type.str.lower() == mention.mention_agency_type.lower()
     )
@@ -134,8 +157,7 @@ def generate_candidates(mention: OfficerMention) -> pd.DataFrame:
     # Remove any columns in cands that exist in mention_df
     cands_clean = cands[[col for col in cands.columns if col not in mention_df.columns]]
     return pd.concat(
-        [mention_df.reset_index(drop=True), cands_clean.reset_index(drop=True)], 
-        axis=1
+        [mention_df.reset_index(drop=True), cands_clean.reset_index(drop=True)], axis=1
     )
 
 
@@ -215,15 +237,11 @@ class PostMatcher:
     ) -> tuple[pd.DataFrame, pd.DataFrame]:
         """for a list of mentions, return the most likely matching stint from the post employment history
         Also returns all candidates with their scores for debugging"""
-        # candidates = pd.concat(generate_candidates(mention) for mention in mentions)
 
-        with ThreadPoolExecutor(max_workers=10) as executor:
+        with ThreadPoolExecutor() as executor:
             candidate_dfs = list(executor.map(generate_candidates, mentions))
-            
-        candidates = pd.concat(candidate_dfs)
 
-        # Get probabilities instead of just predictions
-        # model = self._logistic_model()
+        candidates = pd.concat(candidate_dfs)
 
         model = self._xgboost_model()
         features = featurize(candidates)
@@ -232,13 +250,101 @@ class PostMatcher:
 
         candidates["match_probability"] = probabilities[:, 1]
 
-        # For each mention_uid, keep only the highest probability match
-        best_matches = candidates[candidates["match_probability"] > 0.5].sort_values(
-            "match_probability", ascending=False
-        )
-        best_matches = best_matches.drop_duplicates(subset="mention_uid", keep="first")
+        print(f"\nDEBUG: Initial candidates: {len(candidates)}")
 
-        # Return both best matches and all candidates for debugging
+        # Stage 1: Filter by probability threshold
+        candidates = candidates[candidates["match_probability"] > 0.5]
+
+        print(f"DEBUG: After probability filter (>0.5): {len(candidates)} candidates")
+
+        if len(candidates) == 0:
+            return candidates, candidates
+
+        # Stage 2: Apply agency validation as a HARD FILTER
+        # Only keep candidates where post_agency matches mention_agency OR mentioned_agencies
+        def is_valid_agency_match(row):
+            """Check if post_agency matches mention_agency or any mentioned_agencies"""
+            mention_agency = row.get("mention_agency", "")
+            mentioned_agencies = row.get("mentioned_agencies", "")
+            post_agency = row.get("post_agency_name", "")
+
+            # Skip validation for corrections agencies
+            if mention_agency and "corrections" in mention_agency.lower():
+                print(f"    -> VALID (corrections agency - skip validation)")
+                return True
+
+            # Use the validation helper (with lower threshold for matching)
+            is_valid, reason = validate_agency_match(
+                mention_agency=mention_agency,
+                mentioned_agencies=mentioned_agencies,
+                post_agency=post_agency,
+                threshold=0.85,  # Adjust this threshold as needed
+            )
+
+            if is_valid:
+                print(f"    -> VALID")
+            else:
+                print(f"    -> INVALID: {reason}")
+
+            return is_valid
+
+        print(f"\n{'='*80}")
+        print(f"STAGE 2: Applying agency validation filter")
+        print(f"{'='*80}")
+
+        # Apply the agency filter
+        candidates["is_agency_valid"] = candidates.apply(is_valid_agency_match, axis=1)
+        valid_candidates = candidates[candidates["is_agency_valid"] == True].copy()
+
+        print(f"\n{'='*80}")
+        print(f"DEBUG: Agency validation filtering results:")
+        print(f"- Candidates before agency filter: {len(candidates)}")
+        print(f"- Candidates after agency filter: {len(valid_candidates)}")
+        print(f"- Filtered out: {len(candidates) - len(valid_candidates)}")
+        print(f"{'='*80}\n")
+
+        # If no valid candidates after agency filtering, return empty
+        if len(valid_candidates) == 0:
+            print(
+                "DEBUG: No valid candidates after agency filtering - returning empty DataFrame"
+            )
+            return pd.DataFrame(), candidates
+
+        # Stage 3: From valid candidates, pick best match by probability
+        print(
+            f"\nSTAGE 3: Selecting best matches from {len(valid_candidates)} valid candidates"
+        )
+
+        # Sort by: mention_uid, match_probability (desc)
+        valid_candidates = valid_candidates.sort_values(
+            by=["mention_uid", "match_probability"], ascending=[True, False]
+        )
+
+        print(f"\nValid candidates after sorting:")
+        for idx, row in valid_candidates.iterrows():
+            print(
+                f"  - {row['mention_uid']}: {row['post_first_name']} {row['post_last_name']} @ {row['post_agency_name']} (prob: {row['match_probability']:.4f})"
+            )
+
+        # For each mention + person, keep best match
+        best_per_person = valid_candidates.drop_duplicates(
+            subset=["mention_uid", "post_person_nbr"], keep="first"
+        )
+
+        print(f"\nAfter deduplicating by person: {len(best_per_person)} candidates")
+
+        # For each mention, keep highest probability match
+        best_matches = best_per_person.drop_duplicates(
+            subset="mention_uid", keep="first"
+        )
+
+        print(f"\nFinal best matches: {len(best_matches)}")
+        print(f"\nSelected matches:")
+        for idx, row in best_matches.iterrows():
+            print(
+                f"  - {row['mention_uid']}: {row['post_first_name']} {row['post_last_name']} @ {row['post_agency_name']} (prob: {row['match_probability']:.4f})"
+            )
+
         return best_matches, candidates
 
     def _logistic_model(self):
@@ -261,9 +367,12 @@ class PostMatcher:
 if __name__ == "__main__":
     print("\nDEBUG: Starting matching process...")
 
-    input_df = pd.read_csv("data/input/sample.csv")
+    input_df = pd.read_csv("data/input/mentioned_agencies_agency_type.csv")
 
-    # input_df = input_df.head(10)
+    # input_df = input_df[input_df.fillna("").source_agency.str.contains(r"Riverside County District Attorney")]
+    # input_df = input_df[input_df.fillna("").last_name.str.contains(r"REED")]
+
+    input_df = input_df.head(100)
     print(input_df)
     print(f"\nDEBUG: Read {len(input_df)} records from input CSV")
     print("\nDEBUG: Input data sample:")
@@ -285,6 +394,7 @@ if __name__ == "__main__":
             mention_last_name=row["last_name"],
             mention_agency=row["source_agency"],
             state=row.get("state", None),
+            mentioned_agencies=row.get("mentioned_agencies", ""),
         )
         mentions.append(mention)
         print(f"\nDEBUG: Created mention object:")
@@ -303,9 +413,53 @@ if __name__ == "__main__":
         print(results.head(1))
 
     if len(results) > 0:
-        # Merge back with original data
+        # Add validation column to results
+        validation_results = []
+        for _, row in results.iterrows():
+            # Get mentioned_agencies from input_df for this officer
+            officer_input = input_df[input_df["officer_uid"] == row["mention_uid"]]
+            mentioned_agencies = (
+                officer_input["mentioned_agencies"].iloc[0]
+                if len(officer_input) > 0
+                else ""
+            )
+
+            # Skip validation for corrections agencies
+            mention_agency = row.get("mention_agency", "")
+            if "corrections" in mention_agency.lower():
+                is_valid = True
+                reason = ""
+            else:
+                is_valid, reason = validate_agency_match(
+                    mention_agency=mention_agency,
+                    mentioned_agencies=mentioned_agencies,
+                    post_agency=row["post_agency_name"],
+                )
+
+            validation_results.append(
+                {
+                    "mention_uid": row["mention_uid"],
+                    "is_valid": is_valid,
+                    "validation_reason": reason,
+                }
+            )
+
+        validation_df = pd.DataFrame(validation_results)
+
+        # Merge validation results with results
+        results = results.merge(validation_df, on="mention_uid", how="left")
+
+        # Filter out invalid matches - move them to unmatched
+        valid_results = results[results["is_valid"] == True].copy()
+        invalid_results = results[results["is_valid"] == False].copy()
+
+        print(f"\nDEBUG: Validation results:")
+        print(f"- Valid matches: {len(valid_results)}")
+        print(f"- Invalid matches (agency validation failed): {len(invalid_results)}")
+
+        # Merge valid results with original data
         output_df = input_df.merge(
-            results[
+            valid_results[
                 [
                     "mention_uid",
                     "post_person_nbr",
@@ -313,15 +467,25 @@ if __name__ == "__main__":
                     "post_first_name",
                     "post_middle_name",
                     "post_last_name",
-                    "post_agency_name", 
-                    "post_start_date", 
-                    "post_end_date",  
+                    "post_agency_name",
+                    "post_start_date",
+                    "post_end_date",
+                    "match_probability",
                 ]
             ],
             left_on="officer_uid",
             right_on="mention_uid",
             how="left",
         )
+
+        # Add validation reason for invalid matches
+        invalid_match_reasons = invalid_results.set_index("mention_uid")[
+            "validation_reason"
+        ].to_dict()
+        output_df["validation_reason"] = output_df["officer_uid"].map(
+            invalid_match_reasons
+        )
+
         output_df = output_df.rename(
             columns={
                 "post_person_nbr": "post_uid",
@@ -337,8 +501,10 @@ if __name__ == "__main__":
         output_df["post_middle_name"] = None
         output_df["post_last_name"] = None
         output_df["post_agency_name"] = None
-        output_df["post_start_date"] = None     
-        output_df["post_end_date"] = None     
+        output_df["post_start_date"] = None
+        output_df["post_end_date"] = None
+        output_df["match_probability"] = None
+        output_df["validation_reason"] = None
 
     column_order = [
         # Original officer info
@@ -353,10 +519,13 @@ if __name__ == "__main__":
         "post_middle_name",
         "post_last_name",
         "post_agency_name",
-        "post_start_date",       
-        "post_end_date",   
+        "post_start_date",
+        "post_end_date",
         # Other info
-        "provisional_case_name",       
+        "provisional_case_name",
+        "mentioned_agencies",
+        "match_probability",
+        "validation_reason",
     ]
 
     remaining_cols = [col for col in output_df.columns if col not in column_order]
@@ -412,6 +581,8 @@ if __name__ == "__main__":
                         "Agency",
                         "Agency Type",
                         "Incident Year",
+                        "Mentioned Agencies",
+                        "Validation Reason",
                     ],
                     "Value": [
                         officer_uid,
@@ -421,6 +592,10 @@ if __name__ == "__main__":
                         unmatched_officer["source_agency"],
                         unmatched_officer["agency_type"],
                         unmatched_officer["incident_year"],
+                        unmatched_officer.get("mentioned_agencies", ""),
+                        unmatched_officer.get(
+                            "validation_reason", "No candidates found"
+                        ),
                     ],
                 }
             )
