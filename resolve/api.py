@@ -232,83 +232,47 @@ class NPIClient:
         except requests.exceptions.RequestException as e:
             logger.error(f"Failed to get POST employment count: {e}")
             return None
-
-
-def get_post_data_from_api(
-    api_base_url: str = "http://localhost:8000", state: Optional[str] = None
-) -> pd.DataFrame:
-    """
-    Updated replacement for the original get_post_data() function.
-    Fetches POST employment data from the new dedicated API endpoint.
-
-    Args:
-        api_base_url: Base URL for the API
-        state: Optional state filter
-
-    Returns:
-        DataFrame with POST employment records in the same format as the original function
-    """
-    logger.info(f"Fetching POST data from API at {api_base_url}")
-    if state:
-        logger.info(f"Filtering by state: {state}")
-
-    client = NPIClient(base_url=api_base_url)
-
-    # Check if API is available
-    if not client.health_check():
-        raise ConnectionError(
-            f"Cannot connect to API at {api_base_url}. Make sure the server is running."
-        )
-
-    # Get all employment records
-    employment_records = client.get_all_post_employment_records(state=state)
-
-    if not employment_records:
-        logger.warning("No employment records found from API")
-        return pd.DataFrame()
-
-    # Convert PostEmploymentRecord models to DataFrame
-    post_data = []
-    for record in employment_records:
-        post_data.append(record.dict())
-
-    post = pd.DataFrame(post_data)
-
-    post.loc[:, "post_start_date"] = pd.to_datetime(
-        post["post_start_date"], errors="coerce"
-    )
-    post.loc[:, "post_end_date"] = pd.to_datetime(
-        post["post_end_date"], errors="coerce"
-    ).fillna(pd.Timestamp.today().round(freq="D"))
-
-    # Filter out records with "withheld" in person_nbr
-    selected = (
-        ~post["post_person_nbr"].str.casefold().str.contains("withheld", na=False)
-    )
-
-    outcols = [
-        "post_person_nbr",
-        "post_first_name",
-        "post_middle_name",
-        "post_last_name",
-        "post_suffix",
-        "post_agency_name",
-        "post_agency_type",
-        "post_start_date",
-        "post_end_date",
-        "post_separation_reason",
-        "state", 
-    ]
-
-    # Ensure all columns exist
-    for col in outcols:
-        if col not in post.columns:
-            post[col] = ""
-
-    result = post.loc[selected, outcols]
-    logger.info(f"Returning {len(result)} POST employment records")
-
-    return result
+        
+    def get_officers_by_name(
+    self, 
+    first_name: str, 
+    last_name: str
+) -> List[PostEmploymentRecord]:
+        """
+        Get all officers with matching first/last name across the entire database.
+        Returns all records regardless of middle name, suffix, or agency.
+        
+        Args:
+            first_name: Officer first name
+            last_name: Officer last name
+            
+        Returns:
+            List of PostEmploymentRecord models
+        """
+        try:
+            params = {
+                "first_name": first_name,
+                "last_name": last_name
+            }
+            
+            response = self.session.get(
+                f"{self.base_url}/post/officers/by-name",
+                params=params,
+                timeout=self.timeout
+            )
+            response.raise_for_status()
+            
+            raw_data = response.json()
+            records = [PostEmploymentRecord(**record) for record in raw_data]
+            
+            logger.info(
+                f"Found {len(records)} records for {first_name} {last_name}"
+            )
+            return records
+            
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Failed to get officers by name: {e}")
+            return []
 
 
 def test_post_employment_api(api_base_url: str = "http://localhost:8000"):

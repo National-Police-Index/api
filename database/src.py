@@ -302,3 +302,46 @@ class SupabaseClient:
                 unique_results.append(self._transform_record(record))
 
         return unique_results
+
+    def get_officers_by_name(
+    self, 
+    first_name: str, 
+    last_name: str
+) -> List[PostEmploymentRecord]:
+        """
+        Get all officers with matching first/last name across the entire database.
+        Returns records regardless of middle name, suffix, or agency.
+        Uses prefix matching on last name to catch suffixes (e.g., "JR", "SR", "II").
+        
+        Args:
+            first_name: Officer first name (case-insensitive exact match)
+            last_name: Officer last name (case-insensitive, prefix match to catch suffixes)
+            
+        Returns:
+            List of PostEmploymentRecord models
+        """
+        if not first_name or not last_name:
+            return []
+        
+        try:
+            # Get all records matching first name (exact) and last name (prefix)
+            # This will catch variations like "CHAVEZ", "CHAVEZ JR", "CHAVEZ SR", etc.
+            response = (
+                self.supabase.table("postie")
+                .select("*")
+                .ilike("first_name", first_name)
+                .ilike("last_name", f"{last_name}%")
+                .execute()
+            )
+            
+            if not response.data:
+                return []
+            
+            # Transform all records
+            return [self._transform_record(record) for record in response.data]
+            
+        except Exception as e:
+            print(f"Error in get_officers_by_name: {e}")
+            import traceback
+            traceback.print_exc()
+            return []

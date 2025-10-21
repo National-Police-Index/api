@@ -34,3 +34,16 @@ Potential name collisions:
 
 **Candidates that were not assigned a match**
 - Ignore for now?
+
+
+## flags
+
+Check 1 (Common name ambiguity): Flags when the mention has a common last name AND there are 2+ different officers with the exact same full name (first name and last name) who worked at relevant agencies during the relevant time period.
+
+Check 2 (Same name, different persons, which is redundant with the above but that's fine): Flags when there are 2+ different officers with the exact same full name who worked at relevant agencies during the relevant time period. 
+
+Check 3 (Multiple plausible persons): Flags when there are 2+ different officers with the exact last name, high match probability (>0.75), AND who worked at a matching agency during the relevant time period.
+
+###
+
+to do: 1. ensure that agency name fuzzy matches for county info, 2. gen candidates for common last names, so that we can add them to manual review process rather than remove entirely, 3. re-gen mentioned agencies using updated logic 

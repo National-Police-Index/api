@@ -8,3 +8,6 @@
 target/
 clean/
 venv/
+*.jsonl
+*.txt
+*.db

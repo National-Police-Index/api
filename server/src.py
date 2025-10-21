@@ -11,6 +11,7 @@ import uvicorn
 from database.src import SupabaseClient
 from config import SUPABASE_URL, SUPABASE_KEY
 from models.src import PostEmploymentRecord, CandidateQuery, AgencyType
+import datetime
 
 app = FastAPI(
     title="POST Employment Data API",
@@ -129,7 +130,43 @@ async def get_county_for_agency(
         raise HTTPException(
             status_code=500, detail=f"Failed to get county for agency: {str(e)}"
         )
-
-
+    
+@app.get("/post/officers/by-name", response_model=List[PostEmploymentRecord])
+async def get_officers_by_name(
+    first_name: str = Query(..., description="Officer first name"),
+    last_name: str = Query(..., description="Officer last name"),
+):
+    """
+    Get all officers with matching first/last name across the entire database.
+    Returns all records regardless of middle name, suffix, or agency.
+    Uses prefix matching on last name to catch suffixes like JR, SR, II, etc.
+    
+    This endpoint is useful for manual review to find all potential matches
+    with the same name, including variations in middle names and suffixes.
+    """
+    try:
+        records = db_client.get_officers_by_name(
+            first_name=first_name,
+            last_name=last_name
+        )
+        return records
+    except Exception as e:
+        # Write detailed error to file
+        import traceback
+        from datetime import datetime
+        with open("api_error_log.txt", "a") as f:
+            f.write(f"\n{'='*80}\n")
+            f.write(f"Error at {datetime.now()}\n")
+            f.write(f"Endpoint: /post/officers/by-name\n")
+            f.write(f"Params: first_name={first_name}, last_name={last_name}\n")
+            f.write(f"Error: {str(e)}\n")
+            f.write(f"Traceback:\n{traceback.format_exc()}\n")
+        
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Failed to get officers by name: {str(e)}"
+        )
+    
+    
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
