@@ -2,30 +2,41 @@ from typing import List
 import pandas as pd
 import pickle
 import datetime
-from api import NPIClient
+import sys
+import os
+import hashlib
 
-# from features_rust import featurize
+sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+
+from api import NPIClient
 from models.src import OfficerMention
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from features import featurize
 from helpers import validate_agency_match
 
-# TODO we should be matching on agency name? quizas
-## 2 things to do:
-# 1) if no county is found, then gen candidates over entire table,
-# 1) we should always prioritize the highest proba match that also is in mentioned agencies
+
+def generate_officer_uid(row: pd.Series) -> str:
+    """Generate a unique officer_uid using SHA256 hash based on officer details."""
+    # Extract values and convert to strings, handling NaN/None values
+    first_name = str(row.get('first_name', '')).strip()
+    last_name = str(row.get('last_name', '')).strip()
+    provisional_case_name = str(row.get('provisional_case_name', '')).strip()
+    incident_year = str(row.get('incident_year', '')).strip()
+    incident_month = str(row.get('incident_month', '')).strip()
+    incident_date = str(row.get('incident_date', '')).strip()
+    source_agency = str(row.get('source_agency', '')).strip()
+
+    # Concatenate all fields with a separator
+    combined_string = f"{first_name}|{last_name}|{provisional_case_name}|{incident_year}|{incident_month}|{incident_date}|{source_agency}"
+
+    # Generate SHA256 hash
+    hash_object = hashlib.sha256(combined_string.encode('utf-8'))
+    return hash_object.hexdigest()
 
 
 def generate_candidates(mention: OfficerMention) -> tuple[pd.DataFrame, pd.DataFrame]:
     """for a given mention, return a list of possibly matching stints from the post employment history
     Returns: (filtered_candidates, full_employment_history)"""
-
-    common_ln_df = pd.read_csv("data/input/common_last_names.csv")
-    common_last_names = set(common_ln_df['last_name'].str.strip().str.upper())
-    
-    if mention.mention_last_name.strip().upper() in common_last_names:
-        print(f"DEBUG: Skipping candidate generation for {mention.mention_last_name} - common last name")
-        return pd.DataFrame(), pd.DataFrame()
 
     incident_year = mention.mention_incident_date.year
     prefix_len = 2
@@ -212,7 +223,7 @@ def fetch_all_candidates_with_same_name(
     
 
 def load_model():
-    model_path = "models/best_model_xgboost.pkl"
+    model_path = "../models/best_model_xgboost.pkl"
     """Load a pickled model from a local file path"""
     with open(model_path, "rb") as f:
         model = pickle.load(f)
@@ -287,212 +298,6 @@ class PostMatcher:
             return df
 
 
-#     def find_canonical_stint(
-#     self, mentions: List[OfficerMention]
-# ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict]:
-#         """for a list of mentions, return the most likely matching stint from the post employment history
-#         Also returns all candidates with their scores for debugging, invalid candidates with validation reasons,
-#         and a dict mapping mention_uid to full employment history"""
-
-#         # Store full employment histories
-#         full_employment_histories = {}
-        
-#         with ThreadPoolExecutor() as executor:
-#             results = list(executor.map(generate_candidates, mentions))
-        
-#         candidate_dfs = []
-#         for mention, (filtered_cands, full_history) in zip(mentions, results):
-#             candidate_dfs.append(filtered_cands)
-#             if len(full_history) > 0:
-#                 full_employment_histories[mention.mention_uid] = full_history
-
-#         candidates = pd.concat(candidate_dfs)
-
-#         model = self._xgboost_model()
-#         features = featurize(candidates)
-#         cols = [c for c in features.columns if c in model.feature_names_in_]
-#         probabilities = model.predict_proba(features[cols])
-
-#         candidates["match_probability"] = probabilities[:, 1]
-
-#         print(f"\nDEBUG: Initial candidates: {len(candidates)}")
-
-#         # Stage 1: Filter by probability threshold
-#         candidates = candidates[candidates["match_probability"] > 0.8]
-
-#         print(f"DEBUG: After probability filter (>0.5): {len(candidates)} candidates")
-
-#         if len(candidates) == 0:
-#             return candidates, candidates, pd.DataFrame(), full_employment_histories
-
-#         # IMPORTANT: Save all candidates before filtering for debugging purposes
-#         all_candidates_for_debug = candidates.copy()
-
-#         # Stage 2: Check for issues requiring human review
-#         print(f"\n{'='*80}")
-#         print(f"STAGE 2: Checking for issues requiring human review")
-#         print(f"{'='*80}")
-
-#         # Load common last names
-#         common_ln_df = pd.read_csv("data/input/common_last_names.csv")
-#         common_last_names = set(common_ln_df['last_name'].str.strip().str.upper())
-#         print(f"DEBUG: Loaded {len(common_last_names)} common last names")
-
-#         mention_groups = candidates.groupby('mention_uid')
-#         needs_review_list = []
-#         invalid_candidates = pd.DataFrame()
-
-#         for mention_uid, group in mention_groups:
-#             review_reasons = []
-            
-#             unique_persons = group['post_person_nbr'].nunique()
-#             mention_last_name = group.iloc[0]['mention_last_name'].strip().upper()
-
-#         # Check 2: Multiple persons with exact same name
-#             mention_first_name = group.iloc[0]['mention_first_name'].strip().upper()
-#             mention_last_name = group.iloc[0]['mention_last_name'].strip().upper()
-
-#             # Check if there are multiple different persons with the EXACT same first AND last name as the mention
-#             exact_name_matches = group[
-#                 (group['post_first_name'].str.strip().str.upper() == mention_first_name) &
-#                 (group['post_last_name'].str.strip().str.upper() == mention_last_name)
-#             ]
-
-#             # Count unique person_nbrs with this exact full name
-#             unique_persons_with_exact_name = exact_name_matches['post_person_nbr'].nunique()
-
-#             # Flag if 2+ different persons share the exact first AND last name
-#             if unique_persons_with_exact_name >= 2:
-#                 if mention_last_name in common_last_names:
-#                     review_reasons.append("Common name - multiple persons with exact match")
-#                 else:
-#                     review_reasons.append("Same name, different persons - needs verification")
-            
-#             # If there are any review reasons, flag this mention
-#             if review_reasons:
-#                 group_copy = group.copy()
-#                 group_copy['validation_reason'] = "; ".join(review_reasons) + " - needs human review"
-#                 needs_review_list.append(group_copy)
-#                 print(f"  NEEDS REVIEW: {mention_uid} - {'; '.join(review_reasons)}")
-
-#         if needs_review_list:
-#             needs_review_candidates = pd.concat(needs_review_list)
-            
-#             # Add to invalid
-#             invalid_candidates = needs_review_candidates.copy()
-            
-#             # Remove from candidates pool for auto-matching
-#             candidates = candidates[~candidates['mention_uid'].isin(needs_review_candidates['mention_uid'])]
-            
-#             print(f"DEBUG: Flagged {len(needs_review_candidates['mention_uid'].unique())} mentions for human review")
-#         else:
-#             print(f"DEBUG: No mentions flagged for review")
-
-#         print(f"{'='*80}\n")
-
-#         # Stage 3: Select best match per mention (from non-flagged candidates)
-#         print(f"\n{'='*80}")
-#         print(f"STAGE 3: Selecting best match per mention")
-#         print(f"{'='*80}")
-
-#         # Check if there are any candidates left after filtering
-#         if len(candidates) == 0:
-#             print("DEBUG: No candidates remaining after review filtering")
-#             print(f"\n{'='*80}")
-#             print(f"DEBUG: Final results:")
-#             print(f"- Valid auto-matches: 0")
-#             print(f"- Invalid (agency validation failed): 0")
-#             print(f"- Needs review (common name/ambiguous): {len(needs_review_list) if needs_review_list else 0}")
-#             print(f"- Total invalid/review: {len(invalid_candidates)}")
-#             print(f"{'='*80}\n")
-#             return pd.DataFrame(), all_candidates_for_debug, invalid_candidates, full_employment_histories
-
-#         # Sort by: mention_uid, match_probability (desc)
-#         candidates_sorted = candidates.sort_values(
-#             by=["mention_uid", "match_probability"], ascending=[True, False]
-#         )
-
-#         # For each mention + person, keep best match
-#         best_per_person = candidates_sorted.drop_duplicates(
-#             subset=["mention_uid", "post_person_nbr"], keep="first"
-#         )
-
-#         print(f"\nAfter deduplicating by person: {len(best_per_person)} candidates")
-
-#         # For each mention, keep highest probability match
-#         best_matches = best_per_person.drop_duplicates(
-#             subset="mention_uid", keep="first"
-#         )
-
-#         print(f"\nBest matches to validate: {len(best_matches)}")
-
-#         # Stage 4: Apply agency validation ONLY to best matches
-#         print(f"\n{'='*80}")
-#         print(f"STAGE 4: Applying agency validation to best matches")
-#         print(f"{'='*80}")
-
-#         # If no best matches, return early
-#         if len(best_matches) == 0:
-#             print("DEBUG: No best matches to validate")
-#             print(f"\n{'='*80}")
-#             print(f"DEBUG: Final results:")
-#             print(f"- Valid auto-matches: 0")
-#             print(f"- Invalid (agency validation failed): 0")
-#             print(f"- Needs review (common name/ambiguous): {len(needs_review_list) if needs_review_list else 0}")
-#             print(f"- Total invalid/review: {len(invalid_candidates)}")
-#             print(f"{'='*80}\n")
-#             return pd.DataFrame(), all_candidates_for_debug, invalid_candidates, full_employment_histories
-
-#         def is_valid_agency_match(row):
-#             """Check if post_agency matches mention_agency or any mentioned_agencies"""
-#             mention_agency = row.get("mention_agency", "")
-#             mentioned_agencies = row.get("mentioned_agencies", "")
-#             post_agency = row.get("post_agency_name", "")
-
-#             # Use the validation helper
-#             is_valid, reason = validate_agency_match(
-#                 mention_agency=mention_agency,
-#                 mentioned_agencies=mentioned_agencies,
-#                 post_agency=post_agency,
-#                 threshold=0.8,
-#             )
-
-#             if is_valid:
-#                 print(f"    {row['mention_uid']}: VALID")
-#             else:
-#                 print(f"    {row['mention_uid']}: INVALID - {reason}")
-
-#             return is_valid, reason
-
-#         # Apply validation to best matches only
-#         validation_results = best_matches.apply(
-#             lambda row: pd.Series(is_valid_agency_match(row), index=['is_agency_valid', 'validation_reason']), 
-#             axis=1
-#         )
-#         best_matches_with_validation = pd.concat([best_matches, validation_results], axis=1)
-        
-#         valid_matches = best_matches_with_validation[best_matches_with_validation["is_agency_valid"] == True].copy()
-#         agency_invalid_matches = best_matches_with_validation[best_matches_with_validation["is_agency_valid"] == False].copy()
-
-#         # Combine all invalid candidates
-#         invalid_candidates = pd.concat([invalid_candidates, agency_invalid_matches])
-
-#         print(f"\n{'='*80}")
-#         print(f"DEBUG: Final results:")
-#         print(f"- Valid auto-matches: {len(valid_matches)}")
-#         print(f"- Invalid (agency validation failed): {len(agency_invalid_matches)}")
-#         print(f"- Needs review (common name/ambiguous): {len(needs_review_list) if needs_review_list else 0}")
-#         print(f"- Total invalid/review: {len(invalid_candidates)}")
-#         print(f"{'='*80}\n")
-
-#         print(f"\nFinal valid matches:")
-#         for idx, row in valid_matches.iterrows():
-#             print(
-#                 f"  - {row['mention_uid']}: {row['post_first_name']} {row['post_last_name']} @ {row['post_agency_name']} (prob: {row['match_probability']:.4f})"
-#             )
-
-#         return valid_matches, all_candidates_for_debug, invalid_candidates, full_employment_histories
-
     def find_canonical_stint(
         self, mentions: List[OfficerMention]
     ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict]:
@@ -524,11 +329,36 @@ class PostMatcher:
         print(f"\nDEBUG: Initial candidates: {len(candidates)}")
 
         # Stage 1: Filter by probability threshold
-        candidates = candidates[candidates["match_probability"] > 0.8]
+        candidates_after_prob = candidates[candidates["match_probability"] > 0.8]
 
-        print(f"DEBUG: After probability filter (>0.8): {len(candidates)} candidates")
+        print(f"DEBUG: After probability filter (>0.8): {len(candidates_after_prob)} candidates")
 
-        if len(candidates) == 0:
+        # Stage 1b: Filter by exact first and last name match
+        def has_exact_name_match(row):
+            """Check if first name and last name match exactly (case-insensitive)"""
+            mention_first = str(row.get("mention_first_name", "")).strip().upper()
+            mention_last = str(row.get("mention_last_name", "")).strip().upper()
+            post_first = str(row.get("post_first_name", "")).strip().upper()
+            post_last = str(row.get("post_last_name", "")).strip().upper()
+
+            return (mention_first == post_first) and (mention_last == post_last)
+
+        # Identify candidates that failed exact name match (for flagging)
+        candidates_after_prob["has_exact_name_match"] = candidates_after_prob.apply(has_exact_name_match, axis=1)
+        failed_exact_name_match = candidates_after_prob[~candidates_after_prob["has_exact_name_match"]].copy()
+
+        # Flag these for review
+        failed_exact_name_match["validation_reason"] = "High similarity score but no exact first+last name match"
+
+        candidates = candidates_after_prob[candidates_after_prob["has_exact_name_match"]].copy()
+
+        print(f"DEBUG: After exact name match filter: {len(candidates)} candidates")
+        print(f"DEBUG: Flagged {len(failed_exact_name_match['mention_uid'].unique())} mentions for review (no exact name match)")
+
+        if len(candidates) == 0 and len(failed_exact_name_match) > 0:
+            # All candidates failed exact name match - return them as invalid
+            return pd.DataFrame(), all_candidates_for_debug, failed_exact_name_match, full_employment_histories
+        elif len(candidates) == 0:
             return candidates, candidates, pd.DataFrame(), full_employment_histories
 
         # IMPORTANT: Save all candidates before filtering for debugging purposes
@@ -540,13 +370,14 @@ class PostMatcher:
         print(f"{'='*80}")
 
         # Load common last names
-        common_ln_df = pd.read_csv("data/input/common_last_names.csv")
+        common_ln_df = pd.read_csv("../data/input/common_last_names.csv")
         common_last_names = set(common_ln_df['last_name'].str.strip().str.upper())
         print(f"DEBUG: Loaded {len(common_last_names)} common last names")
 
         mention_groups = candidates.groupby('mention_uid')
         needs_review_list = []
-        invalid_candidates = pd.DataFrame()
+        # Initialize invalid_candidates with those that failed exact name match
+        invalid_candidates = failed_exact_name_match if len(failed_exact_name_match) > 0 else pd.DataFrame()
 
         for mention_uid, group in mention_groups:
             review_reasons = []
@@ -689,6 +520,7 @@ class PostMatcher:
         print(f"- Valid auto-matches: {len(valid_matches)}")
         print(f"- Invalid (agency validation failed): {len(agency_invalid_matches)}")
         print(f"- Needs review (common name/ambiguous): {len(needs_review_list) if needs_review_list else 0}")
+        print(f"- Needs review (no exact name match): {len(failed_exact_name_match['mention_uid'].unique()) if len(failed_exact_name_match) > 0 else 0}")
         print(f"- Total invalid/review: {len(invalid_candidates)}")
         print(f"{'='*80}\n")
 
@@ -720,26 +552,35 @@ class PostMatcher:
 if __name__ == "__main__":
     print("\nDEBUG: Starting matching process...")
 
-    input_df = pd.read_csv("data/input/mentioned_officers.csv")
+    input_df = pd.read_csv("../data/input/involved_officers.csv")
+    input_df = input_df.sample(n=100)
+    print(input_df.head())
+
+    # Check if officer_uid column exists, if not create it
+    if 'officer_uid' not in input_df.columns:
+        print("\nDEBUG: 'officer_uid' column not found, generating UIDs using SHA256 hash...")
+        input_df['officer_uid'] = input_df.apply(generate_officer_uid, axis=1)
+        print(f"DEBUG: Generated {len(input_df)} officer UIDs")
+        print(f"DEBUG: Sample UIDs: {input_df['officer_uid'].head(3).tolist()}")
     # input_df = input_df[input_df.fillna("").last_name.str.contains(r"CANELA")]
 
-    print(input_df.shape)
+
 
     # input_df = input_df.sample(n=10)
 
     # input_df = input_df[input_df.fillna("").source_agency.str.contains(r"Los Angeles County Sheriff\'s Office")]
     # input_df = input_df[input_df.fillna("").first_name.str.contains(r"RUBEN")]
-# 
-
-    # input_df = input_df.sample(n=10)
-    print(input_df)
-    print(f"\nDEBUG: Read {len(input_df)} records from input CSV")
-    print("\nDEBUG: Input data sample:")
-    print(input_df.head(1))
 
     input_df = input_df.fillna("")
     input_df = input_df[~(input_df.incident_year == "")]
     input_df = input_df[~(input_df.provisional_case_name.fillna("") == "")]
+
+    # input_df = input_df.sample(n=10)
+    print(input_df)
+    print(f"\nDEBUG: Read {len(input_df)} records from input CSV")
+    print(input_df.shape)
+    print("\nDEBUG: Input data sample:")
+    print(input_df.head(1))
 
     # Convert to list of OfficerMention objects
     mentions = []
@@ -872,7 +713,7 @@ if __name__ == "__main__":
     column_order.extend(remaining_cols)
 
     output_df = output_df[column_order]
-    output_df.to_csv("data/output/df.csv", index=False)
+    output_df.to_csv("../data/output/interface/df.csv", index=False)
 
     # Create debug Excel file for all officers needing review (unmatched + common last name)
     officers_for_review = output_df[output_df["post_uid"].isna()].copy()
@@ -885,8 +726,175 @@ if __name__ == "__main__":
     for reason, count in reason_counts.items():
         print(f"  - {reason}: {count}")
 
+    with pd.ExcelWriter(
+        "../data/output/interface/unmatched.xlsx", engine="openpyxl"
+    ) as writer:
+        summary_data = {
+            "Total Officers": [len(input_df)],
+            "Auto-Matched Officers": [output_df["post_uid"].notna().sum()],
+            "Officers Needing Review": [len(officers_for_review)],
+            "Match Rate": [
+                f"{output_df['post_uid'].notna().sum() / len(input_df) * 100:.1f}%"
+            ],
+        }
+        
+        # Add breakdown by review reason
+        for reason, count in reason_counts.items():
+            summary_data[f"  - {reason}"] = [count]
+        
+        summary_df = pd.DataFrame(summary_data)
+        summary_df.to_excel(writer, sheet_name="Summary", index=False)
+
+        # Create a sheet for each officer needing review
+        for idx, (_, officer) in enumerate(officers_for_review.iterrows()):
+            officer_uid = officer["officer_uid"]
+
+            # Get all candidates for this officer
+            officer_candidates = all_candidates[
+                all_candidates["mention_uid"] == officer_uid
+            ].copy()
+
+            # Sort by match probability descending
+            if len(officer_candidates) > 0:
+                officer_candidates = officer_candidates.sort_values(
+                    "match_probability", ascending=False
+                )
+
+            # Create sheet name (Excel has 31 char limit)
+            sheet_name = f"{officer['last_name'][:20]}_{idx}"
+
+            # Get review reason
+            review_reason = officer.get("review_reason", "Unknown reason")
+
+            # Create officer info dataframe
+            provisional_case_name = officer.get("provisional_case_name", "")
+            document_link = f"https://clean-juno-dev-cmhrd4e2fef3hrd5.westus2-01.azurewebsites.net/demo/cases/{provisional_case_name}?query_string=" if provisional_case_name else ""
+            
+            officer_info = pd.DataFrame(
+                {
+                    "Field": [
+                        "Officer UID",
+                        "First Name",
+                        "Middle Name",
+                        "Last Name",
+                        "Agency",
+                        "Agency Type",
+                        "Incident Year",
+                        "Mentioned Agencies",
+                        "Provisional Case Name",
+                        "Document Link",
+                        "Review Reason",
+                    ],
+                    "Value": [
+                        officer_uid,
+                        officer["first_name"],
+                        officer["middle_name"],
+                        officer["last_name"],
+                        officer["source_agency"],
+                        officer["agency_type"],
+                        officer["incident_year"],
+                        officer.get("mentioned_agencies", ""),
+                        provisional_case_name,
+                        document_link,
+                        review_reason,
+                    ],
+                }
+            )
+
+            officer_info.to_excel(
+                writer, sheet_name=sheet_name, index=False, startrow=0
+            )
+
+            if len(officer_candidates) > 0:
+                current_row = len(officer_info) + 2
+                
+                # Get unique candidate POST IDs
+                unique_candidates = officer_candidates['post_person_nbr'].unique()
+                
+                # For each unique candidate, show their full employment history
+                for candidate_nbr in unique_candidates:
+                    # Get the candidate's match info
+                    candidate_info = officer_candidates[officer_candidates['post_person_nbr'] == candidate_nbr].iloc[0]
+                    
+                    # Add header for this candidate
+                    pd.DataFrame({"": ["", f"CANDIDATE: {candidate_info['post_first_name']} {candidate_info['post_last_name']} (POST ID: {candidate_nbr}) - Match Probability: {candidate_info['match_probability']:.2%}"]}).to_excel(
+                        writer,
+                        sheet_name=sheet_name,
+                        index=False,
+                        header=False,
+                        startrow=current_row,
+                    )
+                    current_row += 3
+                    
+                    # Get full employment history for this candidate from all_candidates
+                    candidate_history = all_candidates[
+                        (all_candidates['post_person_nbr'] == candidate_nbr) & 
+                        (all_candidates['mention_uid'] == officer_uid)
+                    ].copy()
+                    
+                    # If no history in all_candidates, try to fetch it
+                    if len(candidate_history) == 0:
+                        # Initialize client if needed
+                        client = NPIClient(base_url="http://localhost:8000")
+                        
+                        # Get full employment history for this person
+                        person_history_data = client.get_employment_history(candidate_nbr)
+                        if person_history_data:
+                            candidate_history = pd.DataFrame([h.dict() for h in person_history_data])
+                    
+                    if len(candidate_history) > 0:
+                        # Display key columns for employment history
+                        history_display_cols = [
+                            "post_person_nbr",
+                            "post_first_name",
+                            "post_middle_name",
+                            "post_last_name",
+                            "post_agency_name",
+                            "post_agency_type",
+                            "post_start_date",
+                            "post_end_date",
+                        ]
+                        # Only include columns that exist
+                        history_display_cols = [col for col in history_display_cols if col in candidate_history.columns]
+                        
+                        candidate_history[history_display_cols].to_excel(
+                            writer,
+                            sheet_name=sheet_name,
+                            index=False,
+                            startrow=current_row,
+                        )
+                        current_row += len(candidate_history) + 3
+                    else:
+                        pd.DataFrame({"": ["No employment history found"]}).to_excel(
+                            writer,
+                            sheet_name=sheet_name,
+                            index=False,
+                            header=False,
+                            startrow=current_row,
+                        )
+                        current_row += 3
+                        
+            else:
+                pd.DataFrame({"": ["", "NO CANDIDATES FOUND"]}).to_excel(
+                    writer,
+                    sheet_name=sheet_name,
+                    index=False,
+                    header=False,
+                    startrow=len(officer_info) + 2,
+                )
+
+    total_records = len(input_df)
+    matched_records = output_df["post_uid"].notna().sum()
+    print(f"\nDEBUG: Final statistics:")
+    print(f"Processed {total_records} records")
+    print(
+        f"Found auto-matches for {matched_records} records ({matched_records/total_records*100:.1f}%)"
+    )
+    print(f"Officers needing review: {len(officers_for_review)}")
+    print(f"Created debug Excel file: data/output/interface/unmatched_debug.xlsx")
+
     if len(auto_match_results) > 0:
-        print(f"\nDEBUG: Processing {len(auto_match_results)} matched officers")
+        print(f"\nDEBUG: Creating employment history Excel for {len(auto_match_results)} matched officers")
         
         # Initialize API client for fetching all name candidates
         client = NPIClient(base_url="http://localhost:8000")
@@ -895,8 +903,9 @@ if __name__ == "__main__":
         officers_with_conflicts = []
         officers_without_conflicts = []
         
-        # Store data for officers with no conflicts
-        clean_officers_data = []
+        # Store sheet data to write later (to avoid empty workbook errors)
+        conflicts_sheets = []
+        clean_sheets = []
         
         for idx, (_, match) in enumerate(auto_match_results.iterrows()):
             mention_uid = match["mention_uid"]
@@ -910,6 +919,16 @@ if __name__ == "__main__":
             # Get the officer's name from the match
             first_name = match["post_first_name"]
             last_name = match["post_last_name"]
+            
+            # Parse the mentioned agencies (they're stored as a string representation of a list)
+            import ast
+            try:
+                if mentioned_agencies_str and mentioned_agencies_str != "":
+                    mentioned_agencies = ast.literal_eval(mentioned_agencies_str)
+                else:
+                    mentioned_agencies = []
+            except:
+                mentioned_agencies = []
             
             # Get full employment history for this officer
             if mention_uid in full_employment_histories:
@@ -939,6 +958,7 @@ if __name__ == "__main__":
                     ]
                     
                     if len(all_name_candidates) > 0:
+                        all_name_candidates = all_name_candidates.sort_values("post_start_date")
                         print(f"DEBUG: Found {len(all_name_candidates)} other records with same name (excluding matched officer)")
                         print(f"DEBUG: Unique officers found: {all_name_candidates['post_person_nbr'].nunique()}")
                         has_conflicts = True
@@ -946,37 +966,153 @@ if __name__ == "__main__":
                     else:
                         print(f"DEBUG: All records were for the matched officer - no other candidates")
                         officers_without_conflicts.append(mention_uid)
-                        # Store data for JSONL export
-                        clean_officers_data.append({
-                            'first_name': first_name,
-                            'last_name': last_name,
-                            'post_person_nbr': post_person_nbr,
-                            'provisional_case_name': provisional_case_name,
-                            'person_history': person_history
-                        })
                 else:
                     officers_without_conflicts.append(mention_uid)
-                    # Store data for JSONL export
-                    clean_officers_data.append({
-                        'first_name': first_name,
-                        'last_name': last_name,
-                        'post_person_nbr': post_person_nbr,
-                        'provisional_case_name': provisional_case_name,
-                        'person_history': person_history
-                    })
+                
+                # Create sheet name (Excel has 31 char limit)
+                sheet_name = f"{match['post_last_name'][:15]}_{post_person_nbr}"[:31]
+                
+                # Create officer info header
+                unique_officers_with_same_name = all_name_candidates['post_person_nbr'].nunique() if len(all_name_candidates) > 0 else 0
+                
+                # Create document link
+                doc_link = f"https://clean-juno-dev-cmhrd4e2fef3hrd5.westus2-01.azurewebsites.net/demo/cases/{provisional_case_name}?query_string=" if provisional_case_name else "No case link available"
+                
+                officer_info = pd.DataFrame({
+                    "Field": [
+                        "Mention UID",
+                        "Provisional Case Name",
+                        "Document Link",
+                        "Matched POST Person Number",
+                        "Match Probability",
+                        "First Name",
+                        "Middle Name", 
+                        "Last Name",
+                        "Matched Agency",
+                        "Mentioned Agencies",
+                        "Total Employment Stints (Matched Officer)",
+                        "Other Officers with Same Name in Database",
+                        "CORRECT (Enter 1 for Yes, 0 for No)"
+                    ],
+                    "Value": [
+                        mention_uid,
+                        provisional_case_name,
+                        doc_link,
+                        post_person_nbr,
+                        f"{match['match_probability']:.4f}",
+                        match['post_first_name'],
+                        match['post_middle_name'],
+                        match['post_last_name'],
+                        match['post_agency_name'],
+                        ", ".join(mentioned_agencies) if mentioned_agencies else "None",
+                        len(person_history),
+                        f"{unique_officers_with_same_name} unique officer(s), {len(all_name_candidates)} total record(s)",
+                        ""  # Empty cell for user input
+                    ]
+                })
+                
+                # Store sheet data for later writing
+                sheet_data = {
+                    'sheet_name': sheet_name,
+                    'officer_info': officer_info,
+                    'all_name_candidates': all_name_candidates if has_conflicts else pd.DataFrame(),
+                    'person_history': person_history,
+                    'first_name': first_name,
+                    'last_name': last_name,
+                    'post_person_nbr': post_person_nbr,
+                    'has_conflicts': has_conflicts,
+                    'provisional_case_name': provisional_case_name
+                }
+                
+                if has_conflicts:
+                    conflicts_sheets.append(sheet_data)
+                else:
+                    clean_sheets.append(sheet_data)
         
-        # Generate JSONL file for officers with no conflicts only
-        if len(clean_officers_data) > 0:
+        # Write conflicts file only if there are sheets to write
+        if len(conflicts_sheets) > 0:
+            with pd.ExcelWriter("../data/output/interface/matched_clean_with_conflicts.xlsx", engine="openpyxl") as writer:
+                for sheet_data in conflicts_sheets:
+                    current_row = 0
+                    sheet_data['officer_info'].to_excel(writer, sheet_name=sheet_data['sheet_name'], index=False, startrow=current_row)
+                    current_row += len(sheet_data['officer_info']) + 2
+                    
+                    # Add officers with same name from entire database
+                    if len(sheet_data['all_name_candidates']) > 0:
+                        pd.DataFrame({"": ["", f"OTHER OFFICERS NAMED '{sheet_data['first_name'].upper()} {sheet_data['last_name'].upper()}' IN DATABASE (FOR MANUAL REVIEW):"]}).to_excel(
+                            writer, sheet_name=sheet_data['sheet_name'], index=False, header=False, 
+                            startrow=current_row
+                        )
+                        current_row += 3
+                        
+                        # Display key columns for comparison
+                        display_cols = [
+                            "post_person_nbr",
+                            "post_first_name",
+                            "post_middle_name",
+                            "post_last_name",
+                            "post_agency_name",
+                            "post_start_date",
+                            "post_end_date"
+                        ]
+                        # Only include columns that exist
+                        display_cols = [col for col in display_cols if col in sheet_data['all_name_candidates'].columns]
+                        
+                        sheet_data['all_name_candidates'][display_cols].to_excel(
+                            writer, sheet_name=sheet_data['sheet_name'], index=False, 
+                            startrow=current_row
+                        )
+                        current_row += len(sheet_data['all_name_candidates']) + 3
+                    
+                    # Add full employment history for the MATCHED officer
+                    pd.DataFrame({"": ["", f"FULL EMPLOYMENT HISTORY FOR MATCHED OFFICER (POST ID: {sheet_data['post_person_nbr']}):"]}).to_excel(
+                        writer, sheet_name=sheet_data['sheet_name'], index=False, header=False, 
+                        startrow=current_row
+                    )
+                    current_row += 3
+                    
+                    sheet_data['person_history'].to_excel(
+                        writer, sheet_name=sheet_data['sheet_name'], index=False, 
+                        startrow=current_row
+                    )
+            
+            print(f"Created employment history Excel: data/output/matched_employment_histories.xlsx")
+        else:
+            print("No officers with name conflicts found - skipping matched_employment_histories.xlsx")
+        
+        # Write clean file only if there are sheets to write
+        if len(clean_sheets) > 0:
+            with pd.ExcelWriter("../data/output/interface/matched_clean_no_conflicts.xlsx", engine="openpyxl") as writer:
+                for sheet_data in clean_sheets:
+                    current_row = 0
+                    sheet_data['officer_info'].to_excel(writer, sheet_name=sheet_data['sheet_name'], index=False, startrow=current_row)
+                    current_row += len(sheet_data['officer_info']) + 2
+                    
+                    # Add full employment history for the MATCHED officer
+                    pd.DataFrame({"": ["", f"FULL EMPLOYMENT HISTORY FOR MATCHED OFFICER (POST ID: {sheet_data['post_person_nbr']}):"]}).to_excel(
+                        writer, sheet_name=sheet_data['sheet_name'], index=False, header=False, 
+                        startrow=current_row
+                    )
+                    current_row += 3
+                    
+                    sheet_data['person_history'].to_excel(
+                        writer, sheet_name=sheet_data['sheet_name'], index=False, 
+                        startrow=current_row
+                    )
+            
+            print(f"Created clean matches Excel: data/output/matched_clean_no_conflicts.xlsx")
+            
+            # Generate JSONL file for matched_clean_no_conflicts
             import json
             
-            jsonl_output_path = "data/output/output.jsonl"
+            jsonl_output_path = "../data/output/interface/matched_clean_no_conflicts.jsonl"
             with open(jsonl_output_path, 'w') as jsonl_file:
-                for officer_data in clean_officers_data:
+                for sheet_data in clean_sheets:
                     # Extract officer information
-                    first_name = officer_data['first_name'].strip()
-                    last_name = officer_data['last_name'].strip()
-                    post_person_nbr = officer_data['post_person_nbr']
-                    provisional_case_name = officer_data['provisional_case_name']
+                    first_name = sheet_data['first_name'].strip()
+                    last_name = sheet_data['last_name'].strip()
+                    post_person_nbr = sheet_data['post_person_nbr']
+                    provisional_case_name = sheet_data["provisional_case_name"]
                     
                     # Lowercase the UID for the URL
                     post_person_nbr_lower = post_person_nbr.lower()
@@ -988,7 +1124,7 @@ if __name__ == "__main__":
                     cpdp_url = f"https://national.cpdp.co/officers/{state}_{post_person_nbr_lower}/{last_name.lower()}-{first_name.lower()}"
                     
                     # Get the most recent work stint from person_history
-                    person_history = officer_data['person_history'].sort_values('post_start_date', ascending=False)
+                    person_history = sheet_data['person_history'].sort_values('post_start_date', ascending=False)
                     
                     if len(person_history) > 0:
                         most_recent_stint = person_history.iloc[0]
@@ -1013,7 +1149,7 @@ if __name__ == "__main__":
                     # Create JSON object in the required format
                     json_obj = {
                         "officer_first_name": f"{first_name.upper()}",
-                        "officer_last_name": f"{last_name.upper()}",
+                        "officer_first_name": f"{last_name.upper()}",
                         "provisional_case_name": f"{provisional_case_name}",
                         "certification_id": post_person_nbr.upper(),
                         "npi_url": cpdp_url,
@@ -1023,11 +1159,11 @@ if __name__ == "__main__":
                     # Write as single line to JSONL file
                     jsonl_file.write(json.dumps(json_obj) + '\n')
             
-            print(f"\nCreated JSONL file: {jsonl_output_path}")
-            print(f"Generated {len(clean_officers_data)} JSONL entries for officers with no name conflicts")
+            print(f"Created JSONL file: {jsonl_output_path}")
+            print(f"Generated {len(clean_sheets)} JSONL entries for matched_clean_no_conflicts")
             
         else:
-            print("\nNo officers with clean matches (no conflicts) found - skipping JSONL generation")
+            print("No officers with clean matches found - skipping matched_clean_no_conflicts.xlsx")
         
         # Generate summary statistics
         total_officers = len(input_df)
@@ -1045,23 +1181,22 @@ if __name__ == "__main__":
     {'='*60}
 
     1. Officers Requiring Manual Review: {officers_needing_review} ({officers_needing_review/total_officers*100:.2f}%)
-       - These officers failed validation or had ambiguous matches
+    - These officers failed validation or had ambiguous matches
 
     2. Auto-Matched with Name Conflicts: {auto_matched_with_conflicts} ({auto_matched_with_conflicts/total_officers*100:.2f}%)
-       - These officers passed all filters but have other officers 
-         with the same name in the database
-       - These require manual review and are NOT included in JSONL output
+    - These officers passed all filters but have other officers 
+        with the same name in the database
+    - Output file: data/output/matched_employment_histories.xlsx
 
     3. Auto-Matched Clean (No Conflicts): {auto_matched_clean} ({auto_matched_clean/total_officers*100:.2f}%)
-       - These officers passed all filters and have unique names 
-         in the database
-       - Output file: data/output/matched_clean_no_conflicts_v2.jsonl
+    - These officers passed all filters and have unique names 
+        in the database
+    - Output file: data/output/matched_clean_no_conflicts.xlsx
 
     TOTALS:
     {'='*60}
     Total Auto-Matched: {auto_matched_with_conflicts + auto_matched_clean} ({(auto_matched_with_conflicts + auto_matched_clean)/total_officers*100:.2f}%)
     Overall Match Rate: {(auto_matched_with_conflicts + auto_matched_clean)/total_officers*100:.2f}%
-    Officers Exported to JSONL: {auto_matched_clean} ({auto_matched_clean/total_officers*100:.2f}%)
 
     REVIEW REASONS BREAKDOWN:
     {'='*60}
@@ -1074,8 +1209,8 @@ if __name__ == "__main__":
                 summary_stats += f"  - {reason}: {count} ({count/total_officers*100:.2f}%)\n"
         
         # Write to file
-        with open("data/output/matching_summary_stats_full.txt", "w") as f:
+        with open("../data/output/interface/matching_summary_stats.txt", "w") as f:
             f.write(summary_stats)
         
         print("\n" + summary_stats)
-        print(f"\nSummary statistics saved to: data/output/matching_summary_stats.txt")
+        print(f"\nSummary statistics saved to: data/output/interface/matching_summary_stats.txt")

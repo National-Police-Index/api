@@ -6,7 +6,7 @@ from typing import Optional, List
 import time
 import logging
 
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from models.src import PostEmploymentRecord, AgencyType
 

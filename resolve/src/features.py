@@ -11,7 +11,7 @@ logger = logging.getLogger("idonea." + __name__)
 
 sentence_transformer_model = None
 
-SCALER_PATH = "models/features_scaler.pkl"
+SCALER_PATH = "../models/features_scaler.pkl"
 with open(SCALER_PATH, 'rb') as f:
     TRAINED_SCALER = pickle.load(f)
 

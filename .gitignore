@@ -11,3 +11,5 @@ venv/
 *.jsonl
 *.txt
 *.db
+resolve_v1/
+CLAUDE.md
