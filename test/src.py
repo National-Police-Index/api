@@ -11,7 +11,7 @@ sys.path.append(
 )
 
 from models.src import PostEmploymentRecord, OfficerMention, CandidateQuery, AgencyType
-from resolve.api import NPIClient
+from resolve.src.api import NPIClient
 from database.src import SupabaseClient
 from server.config import SUPABASE_URL, SUPABASE_KEY
 

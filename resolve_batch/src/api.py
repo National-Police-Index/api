@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 class NPIClient:
     """POST Employment API Client with Pydantic model support"""
 
-    def __init__(self, base_url: str = "http://localhost:8000", timeout: int = 30):
+    def __init__(self, base_url: str = "http://localhost:8000", timeout: int = 180):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self.session = requests.Session()
@@ -273,6 +273,119 @@ class NPIClient:
         except requests.exceptions.RequestException as e:
             logger.error(f"Failed to get officers by name: {e}")
             return []
+
+    def get_counties_batch(self, agency_names: List[str]) -> dict:
+        """
+        Get counties for multiple agencies in a single batch request.
+
+        Args:
+            agency_names: List of agency names to lookup
+
+        Returns:
+            Dictionary mapping agency_name -> county (or None if not found)
+        """
+        try:
+            response = self.session.post(
+                f"{self.base_url}/post/agencies/counties/batch",
+                json={"agency_names": agency_names},
+                timeout=self.timeout
+            )
+            response.raise_for_status()
+            data = response.json()
+            return data.get("counties", {})
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Failed to get counties batch: {e}")
+            return {}
+
+    def get_candidates_batch(self, mentions: List[dict]) -> dict:
+        """
+        Get candidates for multiple mentions in a single batch request.
+
+        Args:
+            mentions: List of mention dictionaries with keys:
+                - first_name
+                - last_name
+                - agency_type
+                - start_year
+                - end_year
+                - state (optional)
+
+        Returns:
+            Dictionary mapping mention index (as string) -> list of PostEmploymentRecords
+        """
+        try:
+            response = self.session.post(
+                f"{self.base_url}/post/candidates/batch",
+                json={"mentions": mentions},
+                timeout=self.timeout
+            )
+            response.raise_for_status()
+            data = response.json()
+
+            # DEBUG: Log what we received
+            print(f"[CLIENT DEBUG] Batch API response keys: {data.keys()}")
+            print(f"[CLIENT DEBUG] Results type: {type(data.get('results'))}")
+            print(f"[CLIENT DEBUG] Results keys count: {len(data.get('results', {}))}")
+            if data.get("results"):
+                first_key = list(data.get("results").keys())[0]
+                first_value = data.get("results")[first_key]
+                print(f"[CLIENT DEBUG] First key: {first_key}, type: {type(first_key)}")
+                print(f"[CLIENT DEBUG] First value length: {len(first_value) if isinstance(first_value, list) else 'not a list'}")
+                if first_value and isinstance(first_value, list) and len(first_value) > 0:
+                    print(f"[CLIENT DEBUG] First record keys: {first_value[0].keys() if isinstance(first_value[0], dict) else 'not a dict'}")
+
+            # Convert results to PostEmploymentRecord models
+            results = {}
+            for idx, candidates in data.get("results", {}).items():
+                results[idx] = [PostEmploymentRecord(**record) for record in candidates]
+
+            print(f"[CLIENT DEBUG] Converted {len(results)} mention results")
+            return results
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Failed to get candidates batch: {e}")
+            return {}
+
+    def get_batch_name_uniqueness(self, names: List[List[str]]) -> dict:
+        """
+        Batch check how many unique persons exist for each name pair.
+
+        Args:
+            names: List of [first_name, last_name] pairs
+
+        Returns:
+            Dict mapping "FirstName|LastName" -> count of unique persons
+            Returns empty dict on error for graceful degradation
+        """
+        # Filter out empty/None names
+        valid_names = [
+            [first, last] for first, last in names
+            if first and last and first.strip() and last.strip()
+        ]
+
+        if not valid_names:
+            return {}
+
+        try:
+            response = self.session.post(
+                f"{self.base_url}/post/officers/batch-name-uniqueness",
+                json={"names": valid_names},
+                timeout=60  # Longer timeout for batch operation
+            )
+            response.raise_for_status()
+            data = response.json()
+
+            # Extract name_counts from response
+            return data.get("name_counts", {})
+
+        except requests.exceptions.Timeout:
+            logger.error(f"Timeout calling batch-name-uniqueness with {len(names)} names")
+            return {}
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Failed to get batch name uniqueness: {e}")
+            return {}
+        except Exception as e:
+            logger.error(f"Unexpected error in get_batch_name_uniqueness: {e}")
+            return {}
 
 
 def test_post_employment_api(api_base_url: str = "http://localhost:8000"):

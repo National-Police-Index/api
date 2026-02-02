@@ -229,7 +229,7 @@ Do not include any explanation or other text.
     try:
         response = prompt_gpt(
             prompt,
-            model="gpt-4.1-mini",
+            model="gpt-4.1",
             cached=True,
             logger=logger
         )

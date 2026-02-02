@@ -5,7 +5,7 @@ Debug script to test PyO3-integrated Rust feature engineering
 
 import pandas as pd
 import datetime
-from match import generate_candidates, PostMatcher
+from resolve.src.match_v1 import generate_candidates, PostMatcher
 from features_rust import featurize as rust_featurize
 from features import featurize as python_featurize
 from models.src import OfficerMention
@@ -164,11 +164,13 @@ def test_pyo3_integration():
         matcher = PostMatcher()
         model = matcher._xgboost_model()
         
-        feature_cols = [col for col in rust_features.columns 
+        feature_cols = [col for col in rust_features.columns
                        if any(x in col for x in ["jaro", "levenshtein", "length_ratio", "embedding"])]
         model_features = [c for c in feature_cols if c in model.feature_names_in_]
-        
-        probabilities = model.predict_proba(rust_features[model_features])
+
+        # Ensure we pass a DataFrame with feature names (required by XGBoost 1.6+)
+        features_subset = pd.DataFrame(rust_features[model_features], columns=model_features)
+        probabilities = model.predict_proba(features_subset)
         rust_features['match_probability'] = probabilities[:, 1]
         
         rust_features_sorted = rust_features.sort_values('match_probability', ascending=False)

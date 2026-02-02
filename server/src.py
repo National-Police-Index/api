@@ -5,12 +5,19 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from fastapi import FastAPI, HTTPException, Query, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from typing import List, Optional
+from typing import List, Optional, Dict
 import uvicorn
+import time
 
 from database.src import SupabaseClient
 from config import SUPABASE_URL, SUPABASE_KEY
-from models.src import PostEmploymentRecord, CandidateQuery, AgencyType
+from models.src import (
+    PostEmploymentRecord,
+    CandidateQuery,
+    AgencyType,
+    BatchNameUniquenessRequest,
+    BatchNameUniquenessResponse
+)
 import datetime
 
 app = FastAPI(
@@ -163,10 +170,157 @@ async def get_officers_by_name(
             f.write(f"Traceback:\n{traceback.format_exc()}\n")
         
         raise HTTPException(
-            status_code=500, 
+            status_code=500,
             detail=f"Failed to get officers by name: {str(e)}"
         )
-    
-    
+
+
+@app.post(
+    "/post/officers/batch-name-uniqueness",
+    response_model=BatchNameUniquenessResponse,
+    summary="Batch check name uniqueness",
+    description="""
+    Check how many unique officers exist for multiple name combinations.
+
+    This endpoint accepts a list of [first_name, last_name] pairs and returns
+    the count of unique POST person numbers for each name. This is useful for
+    identifying common names that may require manual review in entity resolution.
+
+    **Example use case**: Before auto-matching officers in the entity resolution
+    pipeline, check if names like "John Smith" appear 15+ times, indicating a
+    common name that should be flagged for manual review.
+
+    **Performance**: Processes names in batch using hash-based partitioning for
+    O(n+m) complexity instead of O(n×m).
+    """,
+    tags=["POST Data - Batch Operations"]
+)
+async def batch_check_name_uniqueness(
+    request: BatchNameUniquenessRequest
+) -> BatchNameUniquenessResponse:
+    """
+    Get the count of unique officers for multiple name combinations.
+
+    Args:
+        request: BatchNameUniquenessRequest containing list of [first_name, last_name] pairs
+
+    Returns:
+        BatchNameUniquenessResponse with name_counts dict mapping "FirstName|LastName" to count
+
+    Example:
+        Request: {"names": [["John", "Smith"], ["Jane", "Doe"]]}
+        Response: {"name_counts": {"John|Smith": 15, "Jane|Doe": 3}, "processing_time_ms": 45.2}
+    """
+    start_time = time.time()
+
+    try:
+        # Call database method to get uniqueness counts
+        name_counts_dict = db_client.get_batch_name_uniqueness(request.names)
+
+        processing_time = (time.time() - start_time) * 1000  # Convert to milliseconds
+
+        return BatchNameUniquenessResponse(
+            name_counts=name_counts_dict,
+            processing_time_ms=round(processing_time, 2)
+        )
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error processing batch name uniqueness check: {str(e)}"
+        )
+
+
+# Batch Processing Endpoints
+
+from pydantic import BaseModel
+
+class BatchCountyRequest(BaseModel):
+    agency_names: List[str]
+
+class BatchCountyResponse(BaseModel):
+    counties: dict
+
+class MentionRequest(BaseModel):
+    first_name: str
+    last_name: str
+    agency_type: str
+    start_year: int
+    end_year: int
+    state: Optional[str] = None
+
+class BatchCandidatesRequest(BaseModel):
+    mentions: List[MentionRequest]
+
+class BatchCandidatesResponse(BaseModel):
+    results: dict
+    metadata: Optional[dict] = None
+
+
+@app.post("/post/agencies/counties/batch", response_model=BatchCountyResponse)
+async def batch_get_counties(request: BatchCountyRequest):
+    """
+    Batch lookup counties for multiple agencies in a single request.
+
+    This endpoint is optimized for bulk operations, reducing network overhead
+    by fetching all county mappings in one request instead of individual calls.
+
+    Args:
+        request: BatchCountyRequest containing list of agency names
+
+    Returns:
+        BatchCountyResponse with dict mapping agency_name -> county
+    """
+    try:
+        counties = db_client.get_counties_for_agencies_batch(request.agency_names)
+        return BatchCountyResponse(counties=counties)
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to batch fetch counties: {str(e)}"
+        )
+
+
+@app.post("/post/candidates/batch", response_model=BatchCandidatesResponse)
+async def batch_get_candidates(request: BatchCandidatesRequest):
+    """
+    Batch candidate generation for multiple officer mentions in a single request.
+
+    Significantly faster than sequential requests for entity resolution pipelines.
+    Processes all mentions in parallel and returns candidates indexed by position.
+
+    Args:
+        request: BatchCandidatesRequest containing list of mention dictionaries
+
+    Returns:
+        BatchCandidatesResponse with results dict (mention_idx -> candidates)
+        and metadata about the batch operation
+    """
+    try:
+        # Convert Pydantic models to dicts for database layer
+        mentions_dicts = [mention.dict() for mention in request.mentions]
+
+        # Get candidates for all mentions
+        results = db_client.get_candidates_for_mentions_batch(mentions_dicts)
+
+        # Calculate metadata
+        total_candidates = sum(len(candidates) for candidates in results.values())
+        mentions_with_candidates = sum(1 for candidates in results.values() if candidates)
+
+        return BatchCandidatesResponse(
+            results=results,
+            metadata={
+                "total_mentions": len(request.mentions),
+                "total_candidates": total_candidates,
+                "mentions_with_candidates": mentions_with_candidates,
+            }
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to batch fetch candidates: {str(e)}"
+        )
+
+
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)

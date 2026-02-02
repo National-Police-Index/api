@@ -322,7 +322,16 @@ class PostMatcher:
         model = self._xgboost_model()
         features = featurize(candidates)
         cols = [c for c in features.columns if c in model.feature_names_in_]
-        probabilities = model.predict_proba(features[cols])
+        # probabilities = model.predict_proba(features[cols])
+
+        features_subset = features[cols].copy()
+        # Explicitly ensure DataFrame structure with column names for XGBoost
+        features_subset = pd.DataFrame(
+            features_subset.values,
+            columns=cols,
+            index=features_subset.index
+        )
+        probabilities = model.predict_proba(features_subset)
 
         candidates["match_probability"] = probabilities[:, 1]
 
@@ -713,7 +722,7 @@ if __name__ == "__main__":
     column_order.extend(remaining_cols)
 
     output_df = output_df[column_order]
-    output_df.to_csv("../data/output/interface/df.csv", index=False)
+    output_df.to_csv("../data/output/df.csv", index=False)
 
     # Create debug Excel file for all officers needing review (unmatched + common last name)
     officers_for_review = output_df[output_df["post_uid"].isna()].copy()
@@ -727,7 +736,7 @@ if __name__ == "__main__":
         print(f"  - {reason}: {count}")
 
     with pd.ExcelWriter(
-        "../data/output/interface/unmatched.xlsx", engine="openpyxl"
+        "../data/output/unmatched.xlsx", engine="openpyxl"
     ) as writer:
         summary_data = {
             "Total Officers": [len(input_df)],
@@ -891,7 +900,7 @@ if __name__ == "__main__":
         f"Found auto-matches for {matched_records} records ({matched_records/total_records*100:.1f}%)"
     )
     print(f"Officers needing review: {len(officers_for_review)}")
-    print(f"Created debug Excel file: data/output/interface/unmatched_debug.xlsx")
+    print(f"Created debug Excel file: data/output/unmatched_debug.xlsx")
 
     if len(auto_match_results) > 0:
         print(f"\nDEBUG: Creating employment history Excel for {len(auto_match_results)} matched officers")
@@ -1031,7 +1040,7 @@ if __name__ == "__main__":
         
         # Write conflicts file only if there are sheets to write
         if len(conflicts_sheets) > 0:
-            with pd.ExcelWriter("../data/output/interface/matched_clean_with_conflicts.xlsx", engine="openpyxl") as writer:
+            with pd.ExcelWriter("../data/output/matched_clean_with_conflicts.xlsx", engine="openpyxl") as writer:
                 for sheet_data in conflicts_sheets:
                     current_row = 0
                     sheet_data['officer_info'].to_excel(writer, sheet_name=sheet_data['sheet_name'], index=False, startrow=current_row)
@@ -1082,7 +1091,7 @@ if __name__ == "__main__":
         
         # Write clean file only if there are sheets to write
         if len(clean_sheets) > 0:
-            with pd.ExcelWriter("../data/output/interface/matched_clean_no_conflicts.xlsx", engine="openpyxl") as writer:
+            with pd.ExcelWriter("../data/output/matched_clean_no_conflicts.xlsx", engine="openpyxl") as writer:
                 for sheet_data in clean_sheets:
                     current_row = 0
                     sheet_data['officer_info'].to_excel(writer, sheet_name=sheet_data['sheet_name'], index=False, startrow=current_row)
@@ -1105,7 +1114,7 @@ if __name__ == "__main__":
             # Generate JSONL file for matched_clean_no_conflicts
             import json
             
-            jsonl_output_path = "../data/output/interface/matched_clean_no_conflicts.jsonl"
+            jsonl_output_path = "../data/output/matched_clean_no_conflicts.jsonl"
             with open(jsonl_output_path, 'w') as jsonl_file:
                 for sheet_data in clean_sheets:
                     # Extract officer information
@@ -1209,8 +1218,8 @@ if __name__ == "__main__":
                 summary_stats += f"  - {reason}: {count} ({count/total_officers*100:.2f}%)\n"
         
         # Write to file
-        with open("../data/output/interface/matching_summary_stats.txt", "w") as f:
+        with open("../data/output/matching_summary_stats.txt", "w") as f:
             f.write(summary_stats)
         
         print("\n" + summary_stats)
-        print(f"\nSummary statistics saved to: data/output/interface/matching_summary_stats.txt")
+        print(f"\nSummary statistics saved to: data/output/matching_summary_stats.txt")

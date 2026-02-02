@@ -12,4 +12,9 @@ venv/
 *.txt
 *.db
 resolve_v1/
+resolve_v2/
 CLAUDE.md
+.claude/agents
+*.log
+*.md
+archive/
