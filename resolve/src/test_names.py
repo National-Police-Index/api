@@ -48,24 +48,33 @@ for officer in matched:
     post_id = officer["post_id"]
     input_first = officer["input_first"]
     input_last = officer["input_last"]
-    
+    matched_first = officer["row"]["post_match"]["post_first_name"].strip().lower()
+
+    # Similarity of the matched POST person's first name to input. If this is
+    # an exact match, the auto-matcher had no name ambiguity to resolve, and
+    # the mere existence of other "similar" people doesn't make the match wrong.
+    matched_similarity = SequenceMatcher(None, input_first, matched_first).ratio()
+    if matched_first == input_first:
+        continue
+
     # Get all POST persons with same last name
     same_last = by_last_name.get(input_last, [])
-    
-    # Find similar first names with different POST IDs
+
+    # Only flag when another POST person is at least as close to the input as
+    # the matched POST person — i.e., there's genuine ambiguity.
     similar_persons = []
     for other_id, other_first in same_last:
         if other_id == post_id:
             continue
-        
+
         ratio = SequenceMatcher(None, input_first, other_first).ratio()
-        if ratio >= FIRST_NAME_THRESHOLD:
+        if ratio >= FIRST_NAME_THRESHOLD and ratio >= matched_similarity:
             similar_persons.append({
                 "post_id": other_id,
                 "first_name": other_first,
                 "similarity": ratio
             })
-    
+
     if similar_persons:
         flagged.append({
             "line": officer["line"],

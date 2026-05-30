@@ -68,7 +68,9 @@ def test_incident_date_within_employment(row: dict) -> tuple[bool, str]:
         return False, f"Could not parse start date: {row['post_match']['post_start_date']}"
     
     end_date = parse_date(row["post_match"]["post_end_date"])
-    if end_date is None:
+    # Pre-1950 end dates are sentinel values in the source data; the pipeline
+    # treats them as null and fills with today. Mirror that here.
+    if end_date is None or end_date.year < 1950:
         end_year = datetime.now().year
     else:
         end_year = end_date.year
@@ -86,39 +88,85 @@ def test_incident_date_within_employment(row: dict) -> tuple[bool, str]:
     return False, f"No incident years {incident_years} within employment {start_year}-{end_year}"
 
 
+_AGENCY_EQUIVALENTS = [
+    ("DEPARTMENT OF PUBLIC SAFETY", "POLICE DEPARTMENT"),
+    ("PUBLIC SAFETY", "POLICE"),
+    ("SHERIFF-CORONER", "SHERIFF"),
+    ("SHERIFFS", "SHERIFF"),
+    ("DEPT", "DEPARTMENT"),
+    ("CSU", "CALIFORNIA STATE UNIVERSITY"),
+    (" REG ", " REGIONAL "),
+    (" SER ", " SERVICES "),
+    ("PUBLICLIC", "PUBLIC"),
+]
+_AGENCY_DROP_TOKENS = {
+    "OFFICE", "DEPARTMENT", "CORONER", "S", "THE", "A", "AN", "OF",
+}
+
+
+def _normalize_agency(name: str) -> set[str]:
+    """Normalize an agency name to a token set for comparison."""
+    s = name.upper()
+    s = s.replace("’", "'").replace("`", "'")
+    for src, dst in _AGENCY_EQUIVALENTS:
+        s = s.replace(src, dst)
+    # Strip punctuation
+    for ch in "'./,()-":
+        s = s.replace(ch, " ")
+    s = s.replace("/", " ")
+    tokens = {t for t in s.split() if t and t not in _AGENCY_DROP_TOKENS}
+    return tokens
+
+
+def _agency_token_similarity(a: str, b: str) -> float:
+    ta, tb = _normalize_agency(a), _normalize_agency(b)
+    if not ta or not tb:
+        return 0.0
+    # Jaccard over the smaller set — captures "Alameda County Sheriff" ⊂
+    # "Alameda County Sheriff's Department/Coroner" as a full match.
+    intersection = ta & tb
+    smaller = min(len(ta), len(tb))
+    return len(intersection) / smaller
+
+
 def test_agency_name_similarity(row: dict) -> tuple[bool, str]:
-    """Test that agency names are sufficiently similar."""
+    """Test that agency names are sufficiently similar after normalization.
+
+    Normalizes equivalents (Office=Department, drops /Coroner suffix,
+    Public Safety=Police, etc.) before comparison so that real spelling
+    variants don't fail the test.
+    """
     threshold = 0.8
-    
+
     source_agencies_raw = row["input_officer"]["source_agency"].strip().upper()
     mentioned_agencies_raw = row["input_officer"].get("mentioned_agencies", "").strip().upper()
     post_agency = row["post_match"]["post_agency_name"].strip().upper()
-    
-    # Build list of all agencies to check against
+
     all_input_agencies = []
-    
     for agency in source_agencies_raw.split(","):
         agency = agency.strip()
         if agency:
             all_input_agencies.append(agency)
-    
     for agency in mentioned_agencies_raw.split(","):
         agency = agency.strip()
         if agency:
             all_input_agencies.append(agency)
-    
-    # Check if any input agency matches the post agency
+
     best_ratio = 0.0
     best_match = ""
-    
+
     for agency in all_input_agencies:
-        ratio = SequenceMatcher(None, agency, post_agency).ratio()
+        # Token similarity catches structural matches; raw SequenceMatcher
+        # is the fallback for genuine string variants.
+        token_ratio = _agency_token_similarity(agency, post_agency)
+        char_ratio = SequenceMatcher(None, agency, post_agency).ratio()
+        ratio = max(token_ratio, char_ratio)
         if ratio > best_ratio:
             best_ratio = ratio
             best_match = agency
         if ratio >= threshold:
             return True, f"Agency match: '{agency}' ~ '{post_agency}' (similarity {ratio:.2f})"
-    
+
     return False, f"No agency match >= {threshold}: best was '{best_match}' vs '{post_agency}' ({best_ratio:.2f})"
 
 
@@ -158,15 +206,21 @@ def test_valid_post_person_nbr(row: dict) -> tuple[bool, str]:
 
 def test_no_empty_critical_fields(row: dict) -> tuple[bool, str]:
     """Test that critical fields are not empty."""
-    critical_input = ["first_name", "last_name", "source_agency"]
+    critical_input = ["first_name", "last_name"]
     critical_post = ["post_first_name", "post_last_name", "post_agency_name", "post_start_date"]
-    
+
     errors = []
-    
+
     for field in critical_input:
         val = row["input_officer"].get(field, "")
         if not val or str(val).strip() == "":
             errors.append(f"input_officer.{field} is empty")
+
+    # source_agency may be empty if mentioned_agencies covers it.
+    src = str(row["input_officer"].get("source_agency", "")).strip()
+    mentioned = str(row["input_officer"].get("mentioned_agencies", "")).strip()
+    if not src and not mentioned:
+        errors.append("input_officer has neither source_agency nor mentioned_agencies")
     
     for field in critical_post:
         val = row["post_match"].get(field, "")
