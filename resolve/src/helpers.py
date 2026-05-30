@@ -66,8 +66,86 @@ from llm import prompt_gpt
 import logging
 import ast
 from datetime import datetime
+import pandas as pd
 
 logger = logging.getLogger('idonea.' + __name__)
+
+
+def ensure_incident_year_column(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Ensure the DataFrame has an 'incident_year' column.
+    If it doesn't exist, create it from 'incident_date'.
+    Handles comma-separated dates by choosing the most recent one.
+
+    Args:
+        df: DataFrame with incident data
+
+    Returns:
+        DataFrame with 'incident_year' column
+    """
+    if 'incident_year' in df.columns:
+        print("DEBUG: 'incident_year' column already exists")
+        return df
+
+    if 'incident_date' not in df.columns:
+        raise ValueError("Neither 'incident_year' nor 'incident_date' column found in DataFrame")
+
+    print("\nDEBUG: 'incident_year' column not found, generating from 'incident_date'...")
+
+    def extract_most_recent_year(date_str):
+        """Extract the year from the most recent date in a comma-separated list of dates"""
+        if pd.isna(date_str) or str(date_str).strip() == "":
+            return None
+
+        date_str = str(date_str).strip()
+
+        # Split by comma to handle multiple dates
+        dates = [d.strip() for d in date_str.split(',') if d.strip()]
+
+        if not dates:
+            return None
+
+        # Parse all dates and find the most recent
+        parsed_dates = []
+        for date in dates:
+            try:
+                # Try different date formats
+                for fmt in ['%Y-%m-%d', '%m/%d/%Y', '%Y/%m/%d', '%m-%d-%Y', '%Y']:
+                    try:
+                        parsed_date = datetime.strptime(date, fmt)
+                        parsed_dates.append(parsed_date)
+                        break
+                    except ValueError:
+                        continue
+            except Exception as e:
+                print(f"DEBUG: Could not parse date '{date}': {e}")
+                continue
+
+        if not parsed_dates:
+            # If no dates could be parsed, try to extract just the year
+            for date in dates:
+                try:
+                    # Try to find a 4-digit year in the string
+                    import re
+                    year_match = re.search(r'\b(19|20)\d{2}\b', date)
+                    if year_match:
+                        return int(year_match.group())
+                except:
+                    continue
+            return None
+
+        # Return the year of the most recent date
+        most_recent = max(parsed_dates)
+        return most_recent.year
+
+    df['incident_year'] = df['incident_date'].apply(extract_most_recent_year)
+
+    # Count how many were successfully parsed
+    parsed_count = df['incident_year'].notna().sum()
+    print(f"DEBUG: Generated {parsed_count} incident years from {len(df)} records")
+    print(f"DEBUG: Sample incident_year values: {df['incident_year'].head(3).tolist()}")
+
+    return df
 
 
 def validate_agency_match(

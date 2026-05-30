@@ -12,7 +12,7 @@ from api import NPIClient
 from models.src import OfficerMention
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from features import featurize
-from helpers import validate_agency_match
+from helpers import validate_agency_match, ensure_incident_year_column
 
 
 def generate_officer_uid(row: pd.Series) -> str:
@@ -317,7 +317,14 @@ class PostMatcher:
             if len(full_history) > 0:
                 full_employment_histories[mention.mention_uid] = full_history
 
-        candidates = pd.concat(candidate_dfs)
+        candidates = pd.concat(candidate_dfs) if candidate_dfs else pd.DataFrame()
+
+        print(f"\nDEBUG: Initial candidates: {len(candidates)}")
+
+        # Early return if no candidates found at all
+        if len(candidates) == 0:
+            print("DEBUG: No candidates found for any mentions - skipping model scoring")
+            return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), full_employment_histories
 
         model = self._xgboost_model()
         features = featurize(candidates)
@@ -335,10 +342,8 @@ class PostMatcher:
 
         candidates["match_probability"] = probabilities[:, 1]
 
-        print(f"\nDEBUG: Initial candidates: {len(candidates)}")
-
         # Stage 1: Filter by probability threshold
-        candidates_after_prob = candidates[candidates["match_probability"] > 0.8]
+        candidates_after_prob = candidates[candidates["match_probability"] > 0.5]
 
         print(f"DEBUG: After probability filter (>0.8): {len(candidates_after_prob)} candidates")
 
@@ -353,16 +358,22 @@ class PostMatcher:
             return (mention_first == post_first) and (mention_last == post_last)
 
         # Identify candidates that failed exact name match (for flagging)
-        candidates_after_prob["has_exact_name_match"] = candidates_after_prob.apply(has_exact_name_match, axis=1)
-        failed_exact_name_match = candidates_after_prob[~candidates_after_prob["has_exact_name_match"]].copy()
+        if len(candidates_after_prob) > 0:
+            candidates_after_prob["has_exact_name_match"] = candidates_after_prob.apply(has_exact_name_match, axis=1)
+            failed_exact_name_match = candidates_after_prob[~candidates_after_prob["has_exact_name_match"]].copy()
 
-        # Flag these for review
-        failed_exact_name_match["validation_reason"] = "High similarity score but no exact first+last name match"
+            # Flag these for review
+            if len(failed_exact_name_match) > 0:
+                failed_exact_name_match["validation_reason"] = "High similarity score but no exact first+last name match"
 
-        candidates = candidates_after_prob[candidates_after_prob["has_exact_name_match"]].copy()
+            candidates = candidates_after_prob[candidates_after_prob["has_exact_name_match"]].copy()
+        else:
+            failed_exact_name_match = pd.DataFrame()
+            candidates = pd.DataFrame()
 
         print(f"DEBUG: After exact name match filter: {len(candidates)} candidates")
-        print(f"DEBUG: Flagged {len(failed_exact_name_match['mention_uid'].unique())} mentions for review (no exact name match)")
+        failed_count = len(failed_exact_name_match['mention_uid'].unique()) if len(failed_exact_name_match) > 0 else 0
+        print(f"DEBUG: Flagged {failed_count} mentions for review (no exact name match)")
 
         if len(candidates) == 0 and len(failed_exact_name_match) > 0:
             # All candidates failed exact name match - return them as invalid
@@ -560,8 +571,11 @@ class PostMatcher:
 
 if __name__ == "__main__":
     print("\nDEBUG: Starting matching process...")
+    import time 
+    start_time = time.time()
 
-    input_df = pd.read_csv("../data/input/involved_officers.csv")
+
+    input_df = pd.read_csv("../data/input/involved_officers_2-2-2026.csv")
     input_df = input_df.sample(n=100)
     print(input_df.head())
 
@@ -571,6 +585,9 @@ if __name__ == "__main__":
         input_df['officer_uid'] = input_df.apply(generate_officer_uid, axis=1)
         print(f"DEBUG: Generated {len(input_df)} officer UIDs")
         print(f"DEBUG: Sample UIDs: {input_df['officer_uid'].head(3).tolist()}")
+
+    # Ensure incident_year column exists (generate from incident_date if needed)
+    input_df = ensure_incident_year_column(input_df)
     # input_df = input_df[input_df.fillna("").last_name.str.contains(r"CANELA")]
 
 
@@ -582,7 +599,29 @@ if __name__ == "__main__":
 
     input_df = input_df.fillna("")
     input_df = input_df[~(input_df.incident_year == "")]
-    input_df = input_df[~(input_df.provisional_case_name.fillna("") == "")]
+    input_df = input_df[~(input_df["authoritative_caseid"].fillna("") == "")]
+    input_df.loc[:, "agency_type"] = "POLICE"
+    input_df.loc[:, "first_name"] = input_df.first_name.str.upper()
+    input_df.loc[:, "last_name"] = input_df.last_name.str.upper()
+    input_df.loc[:, "middle_name"] = input_df.middle_name.str.upper()
+    input_df.loc[:, "suffix"] = input_df.suffix.str.upper()
+    input_df = input_df.rename(columns={"old_case_name": "provisional_case_name"})
+
+    print("\nDEBUG: Columns before rename:")
+    print(input_df.columns.tolist())
+
+    input_df = input_df.rename(columns={"source agencies": "source_agency"})
+
+    print("\nDEBUG: Columns after rename:")
+    print(input_df.columns.tolist())
+
+    # Check if source_agency exists, if not, show what columns might be similar
+    if 'source_agency' not in input_df.columns:
+        print("\nWARNING: 'source_agency' column not found!")
+        print("Columns that contain 'agency' or 'source':")
+        for col in input_df.columns:
+            if 'agency' in col.lower() or 'source' in col.lower():
+                print(f"  - '{col}'")
 
     # input_df = input_df.sample(n=10)
     print(input_df)
@@ -1198,7 +1237,7 @@ if __name__ == "__main__":
     - Output file: data/output/matched_employment_histories.xlsx
 
     3. Auto-Matched Clean (No Conflicts): {auto_matched_clean} ({auto_matched_clean/total_officers*100:.2f}%)
-    - These officers passed all filters and have unique names 
+    - These officers passed all filters and haOve unique names 
         in the database
     - Output file: data/output/matched_clean_no_conflicts.xlsx
 
@@ -1223,3 +1262,6 @@ if __name__ == "__main__":
         
         print("\n" + summary_stats)
         print(f"\nSummary statistics saved to: data/output/matching_summary_stats.txt")
+        end_time = time.time()
+
+        print(f"Time elapsed {end_time - start_time}")
