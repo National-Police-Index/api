@@ -68,6 +68,55 @@ import ast
 from datetime import datetime
 import pandas as pd
 
+
+# Keywords that mark a source agency as non-law-enforcement (prosecutorial,
+# coronial, defense, etc.). These show up as `source_agency` in incident reports
+# but should never be auto-matched to a POST police/sheriff record without a
+# corroborating LE agency in `mentioned_agencies`.
+_NON_LE_KEYWORDS = (
+    "district attorney",
+    "attorney general",
+    "public defender",
+    "coroner",
+    "medical examiner",
+    " da ",
+    " me ",
+    "office of the da",
+)
+
+# Keywords that mark a POST agency as a law-enforcement employer.
+_LE_KEYWORDS = (
+    "police",
+    "sheriff",
+    "marshal",
+    "patrol",
+    "highway patrol",
+    "probation",
+    "corrections",
+    "department of public safety",
+    "public safety",
+)
+
+
+def _is_non_le_agency(name: str) -> bool:
+    if not name:
+        return False
+    n = f" {name.lower().strip()} "
+    if any(kw in n for kw in _LE_KEYWORDS):
+        # Mixed strings like "Sheriff's Office / DA" are LE, not non-LE.
+        return False
+    return any(kw in n for kw in _NON_LE_KEYWORDS)
+
+
+def _all_non_le(agencies: list) -> bool:
+    return bool(agencies) and all(_is_non_le_agency(a) for a in agencies)
+
+
+def _is_le_agency(name: str) -> bool:
+    if not name:
+        return False
+    return any(kw in name.lower() for kw in _LE_KEYWORDS)
+
 logger = logging.getLogger('idonea.' + __name__)
 
 
@@ -205,7 +254,21 @@ def validate_agency_match(
         with open(debug_file, "a") as f:
             f.write("Result: No agencies to compare against\n")
         return False, "No agencies to compare against"
-    
+
+    # Pre-LLM guard: if every agency we'd compare against is a non-LE source
+    # (DA, Coroner, Medical Examiner, Public Defender, Attorney General, etc.)
+    # and the POST agency is a Police/Sheriff/Marshal/Patrol-style LE org,
+    # reject deterministically. The LLM has historically said MATCH here
+    # (e.g. "Alameda County DA" -> "Hayward PD"), producing bad auto-matches.
+    if _all_non_le(agencies_to_check) and _is_le_agency(post_agency):
+        reason = (
+            "Source agency is non-LE (DA/Coroner/ME/etc.) with no mentioned "
+            "LE agencies; cannot auto-validate against an LE POST agency"
+        )
+        with open(debug_file, "a") as f:
+            f.write(f"Result: {reason}\n")
+        return False, reason
+
     with open(debug_file, "a") as f:
         f.write(f"Total agencies to check: {len(agencies_to_check)}\n")
         f.write(f"Agencies list: {agencies_to_check}\n\n")
