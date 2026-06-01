@@ -19,6 +19,10 @@ from helpers import validate_agency_match, ensure_incident_year_column
 #TODO output is missing the full employment history. we can fetch it with post id
 
 CHUNK_SIZE = 100  # Process this many officers per checkpoint
+# Agency validation calls the (Azure) LLM. 100 concurrent calls saturate the
+# connection pool / rate limit and surface as RetryError[APIConnectionError],
+# which wrongly drops valid matches. Keep this modest.
+VALIDATION_MAX_WORKERS = 8
 CHECKPOINT_DIR = "../data/output/checkpoints"
 PROGRESS_FILE = os.path.join(CHECKPOINT_DIR, ".progress.json")
 
@@ -661,7 +665,7 @@ class PostMatcher:
         # Apply validation to best matches in parallel
         print(f"DEBUG: Validating {len(best_matches)} matches in parallel...")
 
-        with ThreadPoolExecutor(max_workers=100) as executor:
+        with ThreadPoolExecutor(max_workers=VALIDATION_MAX_WORKERS) as executor:
             # Convert rows to list for parallel processing
             rows_list = [row for _, row in best_matches.iterrows()]
             validation_results_list = list(executor.map(is_valid_agency_match, rows_list))

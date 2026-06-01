@@ -282,8 +282,7 @@ The Supabase URL is hardcoded in `server/config.py` but can be moved to .env if 
 The sequential pipeline in `resolve/` is the canonical implementation. The previous batch-optimization experiments live under `resolve_archive/resolve_batch/` for reference only — they achieved a measured 2.41x speedup at n=100 but never resolved output-correctness discrepancies vs. sequential, and the batch county lookup remained broken (see `resolve_archive/resolve_batch/COUNTY_LOOKUP_TODO.md`).
 
 **Canonical entry points:**
-- `resolve/src/match.py` — full pipeline
-- `resolve/src/match_fast.py` — faster variant (in-progress)
+- `resolve/src/match.py` — full pipeline (chunked + checkpointed; formerly `match_fast.py`). The previous `match.py` is archived at `resolve_archive/match_old.py`.
 - `resolve/src/post_processing.py`, `filter_auto_matched.py` — post-match cleanup
 - `resolve/src/tests.py`, `test_names.py` — groundtruth validation against `resolve/data/output/auto_matched.jsonl`
 

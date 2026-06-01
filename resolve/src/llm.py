@@ -5,14 +5,11 @@ import tiktoken
 
 from openai import OpenAI, BadRequestError
 import json
-from diskcache import Cache
-import blake3
 from pprint import pprint
-from openai.lib.azure import AzureOpenAI
 from tenacity import (
     retry,
     stop_after_attempt,
-    wait_exponential,
+    wait_random_exponential,
     before_log,
     after_log,
     before_sleep_log,
@@ -32,26 +29,18 @@ tenacity_logger.setLevel(logging.DEBUG)
 AVAILABLE_MODELS = [
     "gpt-4.1-mini",
     "gpt-4.1",
+    "gpt-5.4-nano",
 ]
 
-AZURE_ENDPOINT = os.getenv('AZURE_ENDPOINT')
-AZURE_API_KEY = os.getenv('AZURE_API_KEY')
-API_VERSION = os.getenv('API_VERSION')
+# Switched from Azure to the standard OpenAI API: the Azure endpoint
+# (clean-models.openai.azure.com) was decommissioned and no longer resolves.
+OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
 
+openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
-azure_gpt_client = AzureOpenAI(
-    azure_endpoint=AZURE_ENDPOINT,
-    api_key=AZURE_API_KEY,
-    api_version=API_VERSION
-)
-
-logger.info("Using Azure endpoint for OpenAI services.")
+logger.info("Using standard OpenAI endpoint for OpenAI services.")
 
 GPT4_TURBO_SEED = 1701180024
-
-CACHE_DIR = "llm-responses.cache"
-
-llm_cache = Cache(CACHE_DIR)
 
 
 class ContextLengthExceededError(Exception):
@@ -77,8 +66,7 @@ def prompt_gpt(
         images: Optional[List[str]] = None,
         model='gpt-4.1-mini',  # Default to gpt-4.1-mini as shown in documentation
         debug=False,
-        cached=True,  # Default to True, can be made configurable if needed
-        cache=llm_cache,
+        cached=True,  # Accepted for backwards compatibility; caching is disabled.
         logger=None,
     ) -> str or Dict or List:
     if logger is None:
@@ -88,11 +76,12 @@ def prompt_gpt(
     if model not in AVAILABLE_MODELS:
         raise ValueError(f"Model {model} is not available. Available models: {AVAILABLE_MODELS}")
 
-    gpt4_client = azure_gpt_client
+    gpt4_client = openai_client
 
-    temperature = 0  # Default to 0 for most models
-    if 'o1' in model or 'o3' in model:
-        temperature = 1
+    # Reasoning-style models (o1/o3, gpt-5 family) only accept the default
+    # temperature and reject custom sampling params (temperature/top_p/seed).
+    restricted_params = ('o1' in model or 'o3' in model or model.startswith('gpt-5'))
+    temperature = 1 if ('o1' in model or 'o3' in model) else 0
 
     if few_shot_examples is None:
         few_shot_examples = []
@@ -130,47 +119,41 @@ def prompt_gpt(
         logger.debug(
             f"Prompting GPT ({model} at {gpt4_client.base_url}) with prompt: \n# Few shot learning\n{json.dumps(few_shot_examples_dicts, indent=2)[:100]}...\n# Prompt\n{prompt[:1000]}...")
 
-    serialized_messages = json.dumps(messages, sort_keys=True)
-    if tools:
-        serialized_messages += json.dumps(tools, sort_keys=True)
-    hash_value = blake3.blake3(serialized_messages.encode()).hexdigest()
-    cache_key = f"llm_response-{model}:{hash_value}"
-
     @retry(
-        stop=stop_after_attempt(5),
-        wait=wait_exponential(multiplier=1, min=10, max=80),
+        stop=stop_after_attempt(6),
+        # Randomized exponential backoff adds jitter so concurrent callers don't
+        # retry in lockstep (the thundering-herd that caused APIConnectionError
+        # under high validation concurrency).
+        wait=wait_random_exponential(multiplier=1, min=4, max=90),
         before_sleep=before_sleep_log(logger, logging.DEBUG),
         retry=retry_if_not_exception_type((ContextLengthExceededError, ValueError)),
     )
     def prompt_model_endpoint(messages):
-        logger.debug(f"LLM Cache MISS for {cache_key}\n~~~~~~~~ PROMPTING GPT ({model} at {gpt4_client.base_url}) with ~{len(json.dumps(messages))} characters of input data. ~~~~~~~~")
+        logger.debug(f"~~~~~~~~ PROMPTING GPT ({model} at {gpt4_client.base_url}) with ~{len(json.dumps(messages))} characters of input data. ~~~~~~~~")
         
         # Use the model name directly as the deployment name
         api_model_string = model
         
+        create_kwargs = dict(
+            model=api_model_string,
+            messages=messages,
+        )
+        if tools:
+            create_kwargs["tools"] = tools
+            create_kwargs["tool_choice"] = "auto"
+        # Reasoning/gpt-5 models reject these sampling params; only send them
+        # for the classic chat models that support them.
+        if not restricted_params:
+            create_kwargs.update(
+                temperature=temperature,
+                top_p=1,
+                frequency_penalty=0,
+                presence_penalty=0,
+                seed=GPT4_TURBO_SEED,
+            )
+
         try:
-            if tools:
-                chat_completion = gpt4_client.chat.completions.create(
-                    model=api_model_string,
-                    messages=messages,
-                    tools=tools,
-                    tool_choice='auto',
-                    temperature=temperature,
-                    top_p=1,
-                    frequency_penalty=0,
-                    presence_penalty=0,
-                    seed=GPT4_TURBO_SEED
-                )
-            else:
-                chat_completion = gpt4_client.chat.completions.create(
-                    model=api_model_string,
-                    messages=messages,
-                    temperature=temperature,
-                    top_p=1,
-                    frequency_penalty=0,
-                    presence_penalty=0,
-                    seed=GPT4_TURBO_SEED
-                )
+            chat_completion = gpt4_client.chat.completions.create(**create_kwargs)
         except BadRequestError as e:
             if e.code == 'context_length_exceeded':
                 raise ContextLengthExceededError(e)
@@ -193,25 +176,9 @@ def prompt_gpt(
         if debug:
             logger.debug(response_message)
 
-        if response_message:
-            llm_cache.set(cache_key, response_message)
         return response_message
 
-    if cached:
-        response_message = llm_cache.get(cache_key)
-        if response_message:
-            logger.debug(f"LLM Cache HIT for {cache_key}")
-        # Because there are responses in the cache from before we created the current key syntax...
-        if not response_message and model == 'gpt-4-1106-preview':
-            old_cache_key = f"prompt_gpt4_turbo:{hash_value}"
-            response_message = llm_cache.get(old_cache_key)  # <- Old key
-            if response_message:
-                logger.debug(f"LLM Cache HIT for {old_cache_key}")
-        if response_message:
-            if debug:
-                logger.debug(response_message)
-            return response_message
-        else:
-            return prompt_model_endpoint(messages)
-    else:
-        return prompt_model_endpoint(messages)
+    # LLM response caching is intentionally disabled: we always want a fresh
+    # call so results reflect the current model/prompt. The `cached` argument is
+    # accepted for backwards compatibility but ignored.
+    return prompt_model_endpoint(messages)

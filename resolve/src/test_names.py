@@ -132,7 +132,7 @@ Example:
 NEEDS_REVIEW
 The names "Bob" and "Robert" are common variations that could refer to the same person."""
 
-    response = prompt_gpt(prompt, model='gpt-4.1-mini', cached=True)
+    response = prompt_gpt(prompt, model='gpt-5.4-nano', cached=True)
 
     # Parse response
     lines = response.strip().split('\n', 1)

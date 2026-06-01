@@ -370,7 +370,7 @@ Do not include any explanation or other text.
     try:
         response = prompt_gpt(
             prompt,
-            model="gpt-4.1",
+            model="gpt-5.4-nano",
             cached=True,
             logger=logger
         )
