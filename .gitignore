@@ -18,4 +18,5 @@ CLAUDE.md
 *.log
 *.md
 archive/
+resolve_archive/
 llm-responses.cache/

@@ -27,10 +27,10 @@ The API will be available at `http://localhost:8000`. View API docs at `http://l
 
 ```bash
 cd resolve/src
-python3 match.py
+../../venv/bin/python match.py
 ```
 
-**Important**: The API server must be running before executing the matching pipeline.
+**Important**: The API server must be running before executing the matching pipeline. Run the pipeline from the project venv (see Interpreter note under Dependencies).
 
 ### Building Rust Components (Optional)
 
@@ -66,7 +66,7 @@ api/
 │       ├── api.py       # API client for entity resolution
 │       ├── features.py  # Feature engineering
 │       ├── helpers.py   # Validation utilities
-│       └── llm.py       # LLM-assisted validation (experimental)
+│       └── llm.py       # LLM-assisted agency validation (OpenAI, gpt-5.4-nano)
 └── src/             # Rust performance optimizations
     └── main.rs      # String similarity functions
 ```
@@ -128,9 +128,9 @@ The pipeline runs through multiple stages:
 - Filter by threshold (>0.8)
 
 **Stage 4: Agency Validation**
-- For best match per mention, validate agency alignment
-- Check if `post_agency_name` matches `mention_agency` OR appears in `mentioned_agencies`
-- Uses fuzzy matching (threshold=0.8) via `validate_agency_match()` helper
+- For best match per mention, validate agency alignment via `validate_agency_match()` helper
+- First applies a deterministic **non-LE guard**: rejects when every agency to compare against is non-LE (DA/Coroner/ME/Public Defender/AG) and the POST agency is LE (Police/Sheriff/Marshal/Patrol/etc.); bypassed when any LE agency is in `mentioned_agencies`
+- Otherwise an **LLM** decides whether `post_agency_name` matches `mention_agency` OR any of `mentioned_agencies`. Uses the standard OpenAI API, model `gpt-5.4-nano` (`llm.py`); LLM response caching is disabled (always fresh)
 
 **Output Files** (all in `resolve/data/output/interface/`):
 - `df.csv` - All mentions with match results
@@ -229,6 +229,12 @@ SUPABASE_KEY=your_supabase_api_key_here
 
 The Supabase URL is hardcoded in `server/config.py` but can be moved to .env if needed.
 
+The entity-resolution pipeline needs a separate `.env` in `resolve/src/` for LLM agency validation:
+
+```
+OPENAI_API_KEY=your_openai_api_key_here
+```
+
 ## Dependencies
 
 **Python packages:**
@@ -238,6 +244,9 @@ The Supabase URL is hardcoded in `server/config.py` but can be moved to .env if 
 - pydantic - Data validation
 - python-dotenv - Environment management
 - openpyxl - Excel file generation
+- openai - LLM agency validation (`resolve/src/llm.py`)
+
+**Interpreter note:** run the server with the system Python that has `fastapi`; run the entity-resolution pipeline (`resolve/src/match.py`) from the project **venv** (`venv/bin/python`). The pipeline imports `sentence_transformers`; if the interpreter also has TensorFlow installed it can deadlock at import in non-interactive shells, so prefer the venv which does not.
 
 **Rust dependencies** (optional, for performance):
 - polars - DataFrame operations
@@ -271,7 +280,7 @@ The Supabase URL is hardcoded in `server/config.py` but can be moved to .env if 
 
 **No candidates found for obvious matches**: Check that the state filter isn't too restrictive and that agency_type is set correctly
 
-**Agency validation rejecting valid matches**: Check that mentioned_agencies list includes the POST agency name. The fuzzy matching threshold is 0.8 in `helpers.py:validate_agency_match()`
+**Agency validation rejecting valid matches**: Check that mentioned_agencies list includes the POST agency name. Validation is LLM-based (`helpers.py:validate_agency_match()` → `llm.py`, OpenAI `gpt-5.4-nano`); a deterministic non-LE guard runs first and is bypassed when an LE agency is present in mentioned_agencies. Requires `OPENAI_API_KEY` in `resolve/src/.env`.
 
 **Empty Excel files**: Ensure there is data to write. The code skips creating files when there are no sheets to write.
 
