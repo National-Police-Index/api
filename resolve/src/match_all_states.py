@@ -1,3 +1,19 @@
+"""
+ALL-STATES variant of match.py — runs against the `all_npi_states` table, which has
+NO `county` and NO `agency_type`. Point it at the all_npi_states API via the env var:
+
+    cd resolve/src && NPI_API_URL=http://localhost:8001 ../../venv/bin/python match_all_states.py
+
+Differences from match.py (precision-preserving; see plans/firestore.md):
+  - county lookup + county filtering REMOVED (not available upstream)
+  - agency_type candidate mask REMOVED (no agency_type upstream; everything is POLICE)
+  - same-name ambiguity check is STATE-SCOPED (passes mention.state)
+  - a defensive ambiguity guard routes mentions with >=2 distinct exact-name persons
+    (in-state) to manual review instead of auto-matching
+  - exact first+last name gate and agency validation are unchanged (the real precision gates)
+
+Sample size / seed for quick test runs come from env: SAMPLE_N (default 100), SAMPLE_SEED.
+"""
 from typing import List
 import pandas as pd
 import pickle
@@ -23,7 +39,11 @@ CHUNK_SIZE = 100  # Process this many officers per checkpoint
 # connection pool / rate limit and surface as RetryError[APIConnectionError],
 # which wrongly drops valid matches. Keep this modest.
 VALIDATION_MAX_WORKERS = 8
-CHECKPOINT_DIR = "../data/output/checkpoints"
+# (all-states) ALL outputs go under a dedicated dir so this pipeline NEVER clobbers the
+# postie pipeline's outputs/fixtures (e.g. ../data/output/auto_matched.jsonl).
+OUTPUT_DIR = "../data/output/all_states"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+CHECKPOINT_DIR = os.path.join(OUTPUT_DIR, "checkpoints")
 PROGRESS_FILE = os.path.join(CHECKPOINT_DIR, ".progress.json")
 
 
@@ -60,15 +80,24 @@ def check_name_for_early_filtering(mention: OfficerMention, common_last_names: s
     mention_last_name = mention.mention_last_name.strip().upper()
     mention_first_name = mention.mention_first_name.strip().upper()
 
+    # Check 0 (all-states): a state is required. Without one we can't scope candidate
+    # generation or the same-name ambiguity check, and an unscoped query over 3.7M rows
+    # times out. Route to manual review rather than risk an unsafe match.
+    if not mention.state:
+        return True, "No state provided - cannot safely resolve against all-states table"
+
     # Check 1: Common last name
     if mention_last_name in common_last_names:
         return True, f"Common last name ({mention_last_name}) - requires manual verification"
 
-    # Check 2: Multiple unique persons with same name in entire database
+    # Check 2: Multiple unique persons with same name IN THE SAME STATE.
+    # (all-states) State-scoped so ambiguity means the same thing it did when postie was
+    # CA-only — otherwise cross-state homonyms across 24 states would mis-scope this.
     try:
         all_records = client.get_officers_by_name(
             first_name=mention.mention_first_name,
-            last_name=mention.mention_last_name
+            last_name=mention.mention_last_name,
+            state=mention.state
         )
 
         if all_records:
@@ -76,7 +105,7 @@ def check_name_for_early_filtering(mention: OfficerMention, common_last_names: s
             unique_persons = set(record.post_person_nbr for record in all_records)
 
             if len(unique_persons) >= 2:
-                return True, f"Multiple persons ({len(unique_persons)}) with same name in database - needs verification"
+                return True, f"Multiple persons ({len(unique_persons)}) with same name in state - needs verification"
 
     except Exception as e:
         print(f"DEBUG: Error checking name uniqueness for {mention_first_name} {mention_last_name}: {e}")
@@ -100,15 +129,14 @@ def generate_candidates(mention: OfficerMention) -> tuple[pd.DataFrame, pd.DataF
 
     client = NPIClient()  # base_url from NPI_API_URL env (default localhost:8000)
 
-    source_county = None
-    # Only look up county for non-CORRECTIONS agencies
-    if mention.mention_agency and mention.mention_agency_type.upper() != "CORRECTIONS":
-        source_county = client.get_county_for_agency(mention.mention_agency)
-        print(
-            f"DEBUG: Source agency '{mention.mention_agency}' is in county: {source_county}"
-        )
-    elif mention.mention_agency_type.upper() == "CORRECTIONS":
-        print(f"DEBUG: CORRECTIONS agency type - skipping county lookup")
+    # (all-states) Require a state — an unscoped name query over 3.7M rows times out and
+    # can't be matched safely. (Early filtering already routes stateless mentions to review.)
+    if not mention.state:
+        print("DEBUG: No state on mention - skipping candidate generation (all-states)")
+        return pd.DataFrame(), pd.DataFrame()
+
+    # NOTE (all-states): county does not exist in all_npi_states, so there is no county
+    # lookup or county-based filtering here. Candidates are scoped by state at the API.
 
     print(f"first_name: {mention.mention_first_name}")
     print(f"last_name: {mention.mention_last_name}")
@@ -140,50 +168,22 @@ def generate_candidates(mention: OfficerMention) -> tuple[pd.DataFrame, pd.DataF
     print(f"DEBUG: Retrieved {len(post)} candidates from API")
     print(post)
 
-    # Only apply county filtering for non-CORRECTIONS agencies
-    if source_county and mention.mention_agency_type.upper() != "CORRECTIONS":
-        print(f"DEBUG: Filtering candidates by county: {source_county}")
-        # Group by post_person_nbr and check if they have ANY record in the source county
-        person_has_county_match = post.groupby("post_person_nbr")["county"].apply(
-            lambda counties: source_county in counties.values
-        )
-        valid_person_nbrs = person_has_county_match[
-            person_has_county_match
-        ].index.tolist()
-
-        print(
-            f"DEBUG: Found {len(valid_person_nbrs)} unique officers with employment in {source_county} county"
-        )
-        post = post[post["post_person_nbr"].isin(valid_person_nbrs)]
-        print(f"DEBUG: After county filtering: {len(post)} candidate records remain")
-
-        if len(post) == 0:
-            print(
-                f"DEBUG: No candidates found with employment history in {source_county} county"
-            )
-            return pd.DataFrame(), full_employment_history
-    elif mention.mention_agency_type.upper() == "CORRECTIONS":
-        print(
-            f"DEBUG: CORRECTIONS agency - skipping county filtering, keeping all {len(post)} candidates"
-        )
-    else:
-        print(f"DEBUG: No source county found - keeping candidates from all counties ({len(post)} candidates)")
-
-    agency_type = (
-        post.post_agency_type.str.lower() == mention.mention_agency_type.lower()
-    )
+    # (all-states) No county filtering — county is not available in all_npi_states.
+    # (all-states) No agency_type mask — agency_type is not available upstream.
     fn_prefix = (
         mention.mention_first_name[:prefix_len].casefold()
         if mention.mention_first_name
         else "Z"
     )
 
-    # Fix empty string handling in end dates
-    # Replace empty strings with NaN first, then fill with today's date
-    end_dates_cleaned = post.post_end_date.replace("", pd.NaT)
+    # (all-states) all_npi_states dates are tz-AWARE ISO timestamps (e.g. "...Z"), unlike
+    # postie's tz-naive ones. Normalize to tz-naive so .dt works and fillna(today) is safe.
+    start_dates = pd.to_datetime(post.post_start_date, utc=True, errors="coerce").dt.tz_localize(None)
 
-# Also treat obviously invalid dates as NaT (dates before 1950)
-    end_dates_cleaned = pd.to_datetime(end_dates_cleaned, errors='coerce')
+    # Fix empty string handling in end dates; treat dates before 1950 as NaT
+    end_dates_cleaned = pd.to_datetime(
+        post.post_end_date.replace("", pd.NaT), utc=True, errors="coerce"
+    ).dt.tz_localize(None)
     end_dates_cleaned = end_dates_cleaned.where(
         (end_dates_cleaned.isna()) | (end_dates_cleaned.dt.year >= 1950),
         pd.NaT
@@ -194,7 +194,7 @@ def generate_candidates(mention: OfficerMention) -> tuple[pd.DataFrame, pd.DataF
 
     # Compare years instead of exact dates with buffer
     date_in_range = (
-        pd.to_datetime(post.post_start_date).dt.year <= incident_year + 1
+        start_dates.dt.year <= incident_year + 1
     ) & (end_dates_filled.dt.year >= incident_year - 1)
 
     fn_cand = post.post_first_name.str[:prefix_len].str.casefold() == fn_prefix
@@ -210,7 +210,6 @@ def generate_candidates(mention: OfficerMention) -> tuple[pd.DataFrame, pd.DataF
     )
 
     print(f"DEBUG: Initial filter counts:")
-    print(f"- Agency type matches: {agency_type.sum()}")
     print(f"- Date in range: {date_in_range.sum()}")
     print(f"- First name prefix matches: {fn_cand.sum()}")
     print(f"- Full first name matches: {fn_full_cand.sum()}")
@@ -219,8 +218,8 @@ def generate_candidates(mention: OfficerMention) -> tuple[pd.DataFrame, pd.DataF
 
     cands = pd.concat(
         [
-            post.loc[agency_type & date_in_range & fn_cand & ln_full_cand],
-            post.loc[agency_type & date_in_range & fn_full_cand & ln_cand],
+            post.loc[date_in_range & fn_cand & ln_full_cand],
+            post.loc[date_in_range & fn_full_cand & ln_cand],
         ]
     ).drop_duplicates()
 
@@ -608,6 +607,21 @@ class PostMatcher:
         if len(candidates) == 0:
             return pd.DataFrame(), all_candidates_for_debug, invalid_candidates, full_employment_histories
 
+        # (all-states) Defensive ambiguity guard: with no county pre-filter, never auto-match
+        # a mention that has >=2 distinct persons with an EXACT name match among its in-state
+        # candidates. Such mentions are ambiguous -> route to manual review (no false positives).
+        person_counts = candidates.groupby("mention_uid")["post_person_nbr"].nunique()
+        ambiguous_uids = set(person_counts[person_counts >= 2].index)
+        if ambiguous_uids:
+            print(f"DEBUG: Ambiguity guard flagged {len(ambiguous_uids)} mention(s) with >=2 exact-name persons in-state")
+            ambiguous_rows = candidates[candidates["mention_uid"].isin(ambiguous_uids)].copy()
+            ambiguous_rows = ambiguous_rows.drop_duplicates(subset="mention_uid")
+            ambiguous_rows["validation_reason"] = "Multiple distinct persons with exact name match in state - ambiguous (no auto-match)"
+            invalid_candidates = pd.concat([invalid_candidates, ambiguous_rows])
+            candidates = candidates[~candidates["mention_uid"].isin(ambiguous_uids)].copy()
+            if len(candidates) == 0:
+                return pd.DataFrame(), all_candidates_for_debug, invalid_candidates, full_employment_histories
+
         # Stage 2: Select best match per mention
         print(f"\n{'='*80}")
         print(f"STAGE 2: Selecting best match per mention")
@@ -785,7 +799,9 @@ if __name__ == "__main__":
             mention_middle_name=row["middle_name"],
             mention_last_name=row["last_name"],
             mention_agency=row["source_agency"],
-            state=row.get("state", None),
+            # (all-states) a state is REQUIRED to query all_npi_states safely. This input
+            # is California POST data and has no `state` column, so default via env.
+            state=(row.get("state") or os.environ.get("DEFAULT_STATE") or None),
             mentioned_agencies=row.get("mentioned_agencies", ""),
         )
         mentions.append(mention)
@@ -963,7 +979,7 @@ if __name__ == "__main__":
     column_order.extend(remaining_cols)
 
     output_df = output_df[column_order]
-    output_df.to_csv("../data/output/df_fast.csv", index=False)
+    output_df.to_csv(f"{OUTPUT_DIR}/df_fast.csv", index=False)
 
     # ========================================================================
     # CREATE JSONL OUTPUT FILES
@@ -1045,7 +1061,7 @@ if __name__ == "__main__":
         record = create_officer_record(row, include_post_match=True)
         auto_matched_records.append(record)
 
-    auto_matched_path = "../data/output/auto_matched.jsonl"
+    auto_matched_path = f"{OUTPUT_DIR}/auto_matched.jsonl"
     with open(auto_matched_path, 'w') as f:
         for record in auto_matched_records:
             f.write(json.dumps(record, default=str) + '\n')
@@ -1078,7 +1094,7 @@ if __name__ == "__main__":
 
         early_filtered_records.append(record)
 
-    early_filtered_path = "../data/output/early_filtered.jsonl"
+    early_filtered_path = f"{OUTPUT_DIR}/early_filtered.jsonl"
     with open(early_filtered_path, 'w') as f:
         for record in early_filtered_records:
             f.write(json.dumps(record, default=str) + '\n')
@@ -1122,7 +1138,7 @@ if __name__ == "__main__":
 
         failed_er_records.append(record)
 
-    failed_er_path = "../data/output/failed_entity_resolution.jsonl"
+    failed_er_path = f"{OUTPUT_DIR}/failed_entity_resolution.jsonl"
     with open(failed_er_path, 'w') as f:
         for record in failed_er_records:
             f.write(json.dumps(record, default=str) + '\n')
@@ -1176,7 +1192,7 @@ if __name__ == "__main__":
     print(f"{'='*80}\n")
 
     with pd.ExcelWriter(
-        "../data/output/unmatched_fast.xlsx", engine="openpyxl"
+        f"{OUTPUT_DIR}/unmatched_fast.xlsx", engine="openpyxl"
     ) as writer:
         summary_data = {
             "Metric": [
