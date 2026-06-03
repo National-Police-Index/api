@@ -1,261 +1,153 @@
-# NPI Employment Data API
+# National Police Index (NPI) API
 
-A REST API and interactive search tool for accessing POST (Peace Officer Standards and Training) officer employment records through the National Police Index. D
+A REST API over POST (Peace Officer Standards and Training) officer employment records for
+**all loaded states**, plus a modular **entity-resolution** library that matches officer
+mentions in incident reports to verified employment records.
 
-> **📄 New: all-states flow.** The current, general pipeline syncs the NPI's live Firestore into
-> Supabase (`all_npi_states`, ~24 states) and resolves any officer in **any state** — no
-> California-specific assumptions, no `county`/`agency_type` required. See **[PIPELINE.md](./PIPELINE.md)**
-> for the full flow (fetch → sync → serve → entity resolution).
->
-> The Quick Start below covers the **legacy CA `postie`** API (port 8000). The all-states stack
-> lives in `etl/` (Firestore sync), `server_all_states/` (API on port 8001), and
-> `resolve/src/match_all_states.py` (pipeline). Switch the pipeline between them with the
-> `NPI_API_URL` env var.
+The repo is **API-centric**: the FastAPI app (`api/`) is the primary entry point, and the
+entity-resolution pipeline (`resolve/`) is a standalone, importable library that works either
+from an input CSV (batch) or directly from a name (single), fetching candidates from the API.
 
-## Interactive explorer (TUI)
+```
+api/        FastAPI app over the all_npi_states table (port 8001)
+              app.py · database.py (AllStatesClient) · config.py
+resolve/    entity-resolution library + CLI
+              pipeline.py (PostMatcher)  candidates.py  features.py  scoring.py
+              agency.py  validation.py  llm.py  client.py (NPIClient)
+              explain.py (gate sections)  io.py  cli.py
+              data/ · models/ (XGBoost + scaler)
+shared/     models.py (Pydantic) · env.py (.env discovery)
+etl/        Firestore → Supabase sync (full + incremental)
+tools/      explore_tui.py · pipeline_runner.py  (manual exploration)
+tests/      pytest suite (unit + opt-in integration)
+notebooks/  EDA / scratch notebooks
+run.py      single launcher (api | resolve)
+archive/legacy_ca/   the deprecated CA-only `postie` stack (server/, database/, …)
+```
 
-`resolve/src/explore_tui.py` is a terminal UI for **playing with the all-states stack** by hand.
-It has two modes:
+> **Data:** `all_npi_states` (~3.7M rows, ~24 states) is mirrored from the NPI's Firestore by
+> `etl/`. See **[PIPELINE.md](./PIPELINE.md)** for the full fetch → sync → serve → resolve flow.
 
-- **Search** — query the API directly (employment search by name/state/agency, or "all officers
-  by name" to see same-name ambiguity).
-- **Pipeline** — run the **real** entity-resolution pipeline on one mention you type in
-  (Stage 0 early-filter → candidate generation → XGBoost scoring → exact-name gate →
-  agency validation) and see the verdict (AUTO-MATCHED vs ROUTED TO REVIEW + reason), the
-  scored candidates, and the full pipeline log.
+## Quick start
 
-### Run it
+> **Use the project venv (`venv/bin/python`) for everything** — API *and* pipeline. The venv has
+> fastapi/uvicorn/supabase *and* the ML deps, and (unlike the global Python) **no tensorflow**, so
+> it avoids the `sentence-transformers` import-deadlock. Don't run any of this with the global Python.
+
+### 1. Serve the API
 
 ```bash
-# 1. start the all-states API (separate terminal) — uses the global python that has fastapi
-cd server_all_states && /Users/ayyubibrahim/bin/python3 src.py        # :8001
-
-# 2. run the TUI from resolve/src, under the VENV, pointed at that API
-cd resolve/src && NPI_API_URL=http://localhost:8001 ../../venv/bin/python explore_tui.py
+venv/bin/python run.py api    # :8001
+# docs at http://localhost:8001/docs
 ```
 
-**It must run under the venv and from `resolve/src`** — pipeline mode imports
-`sentence_transformers` (which deadlocks under the global Python that has TensorFlow), and the
-pipeline reads its model/CSV by relative path. Pipeline mode also needs `OPENAI_API_KEY` in
-`resolve/src/.env` (agency validation).
+`SUPABASE_KEY` is read from `.env` (any of repo-root `.env`, `resolve/.env`, or the archived
+`server/.env`) via `shared/env.py`.
 
-### Using it
+### 2. Run entity resolution
 
-- Press **S** for Search, **P** for Pipeline; **Esc** goes back, **Ctrl+F** jumps back to the
-  form to edit, **q** quits (and **Ctrl+C** always quits, even mid-typing).
-- Results land in a table that's focused automatically — **↑/↓** scroll, **PgUp/PgDn** page,
-  **Ctrl+Home/Ctrl+End** jump to top/bottom.
-- **Pipeline mode caveats:** name + state + incident year are required, and the **incident year
-  must fall within the officer's years of service** (candidates are filtered to incident year
-  ± 1). A run takes ~15–30s because it loads the model in an isolated subprocess (this keeps the
-  heavy library output from bleeding onto the screen).
-- **Verified example:** First `Scott`, Last `Lunger`, State `CA`, Year `2015`, Source agency
-  `Hayward Police Department` → auto-matches to POST `b04-j30`.
-
-## Quick Start
-
-### 1. Setup Environment
+**From a name (direct, candidates fetched from the API):**
 
 ```bash
-# Install dependencies
-pip install fastapi uvicorn supabase python-dotenv requests pandas
-
-# Create .env file with your Supabase key
-echo "SUPABASE_KEY=your_supabase_key_here" > .env
+venv/bin/python run.py resolve from-name \
+    --first Scott --last Lunger --state CA --year 2015 \
+    --source-agency "Hayward Police Department" --api http://localhost:8001
+# -> AUTO-MATCHED -> b04-j30 (Hayward Police Department)
 ```
 
-### 2. Start the API Server
+**From a CSV (batch):**
 
 ```bash
-# Terminal 1: Start the API server
-cd server
-python3 src.py
+venv/bin/python run.py resolve from-csv \
+    --input resolve/data/input/involved_officers_2-2-2026.csv \
+    --api http://localhost:8001 --default-state CA \
+    --output-dir resolve/data/output/all_states
 ```
 
-The API will be available at `http://localhost:8000`
+Outputs: `auto_matched.jsonl`, `early_filtered.jsonl`, `failed_entity_resolution.jsonl`,
+`results.csv`.
 
-## Features
+### As a library
 
-### API Endpoints
-- **POST Employment Records**: Retrieve officer employment records with structured name fields
-- **Employment Count**: Get total number of employment records
-- **Employment Statistics**: View database statistics and employment distributions
-- **Health Check**: Verify API status
+```python
+from resolve import PostMatcher, build_mention
 
-### Search Tool
-- Interactive terminal interface for browsing POST employment data
-- Search by first name, last name, or agency
-- View detailed employment records with structured name fields
-- Navigate through employment history and separation details
+matcher = PostMatcher(api_url="http://localhost:8001")
+verdict = matcher.resolve_one(build_mention({
+    "first_name": "Scott", "last_name": "Lunger", "state": "CA",
+    "incident_year": 2015, "source_agency": "Hayward Police Department",
+}))
+print(verdict.status, verdict.match)        # "auto_matched", {...}
 
-### Entity Resolution Support
-- Optimized for entity resolution pipelines
-- Structured name fields (first_name, middle_name, last_name, suffix)
-- Efficient querying by name components
-- Compatible with machine learning matching algorithms
-
-## API Usage
-
-### Get Employment Records
-```bash
-# Basic name searches
-curl "http://localhost:8000/post/employment?last_name=Smith"
-curl "http://localhost:8000/post/employment?first_name=John&last_name=Smith"
-
-# State-based filtering
-curl "http://localhost:8000/post/employment?state=CA&limit=10"
-curl "http://localhost:8000/post/employment?first_name=Robert&state=MA"
-
-# Agency filtering
-curl "http://localhost:8000/post/employment?agency=Los Angeles Police Department"
-curl "http://localhost:8000/post/employment?agency=Police&state=NY"
-
-# Pagination and limits
-curl "http://localhost:8000/post/employment?limit=100&offset=0"
-curl "http://localhost:8000/post/employment?limit=50&offset=100"
-
-# Combined filtering (multiple criteria)
-curl "http://localhost:8000/post/employment?first_name=John&last_name=Smith&state=CA&limit=20"
-
-# Basic candidate search for entity resolution
-curl "http://localhost:8000/post/candidates?first_name=Robert&last_name=Smith&agency_type=POLICE&start_year=2018&end_year=2020"
-
-# Candidates with state filter for entity res
-curl "http://localhost:8000/post/candidates?first_name=Robert&last_name=Smith&agency_type=POLICE&start_year=2018&end_year=2020&state=CA"
-
-# Different agency types
-curl "http://localhost:8000/post/candidates?first_name=John&last_name=Doe&agency_type=CORRECTIONS&start_year=2015&end_year=2023"
+results = matcher.resolve_batch(list_of_mentions)
 ```
 
-### Get Employment Count
-```bash
-# Total count
-curl "http://localhost:8000/post/employment/count"
+`PostMatcher` takes injectable `client`, `scorer`, and `validator` dependencies, so it is easy
+to test and reuse.
 
-# Filtered counts
-curl "http://localhost:8000/post/employment/count?state=CA"
-curl "http://localhost:8000/post/employment/count?first_name=Robert&state=NY"
-curl "http://localhost:8000/post/employment/count?agency=Police"
-```
+## How matching works (precision gates)
 
-### View Statistics
-```bash
-curl "http://localhost:8000/post/stats"
-```
+`OfficerMention` → candidates from the API → XGBoost scoring → gates → verdict.
 
-## Data Structure
+| Stage | Rule |
+|---|---|
+| Stage 0 — early filter | route to review on: no state (when required), common surname, or ≥2 same-name persons (state-scoped) |
+| Stage 1 — candidates | name net + temporal (±1yr). **Optional**: county filter (if a county is known & not CORRECTIONS), agency_type mask (if the data carries real types) |
+| Stage 2 — scoring | XGBoost match probability; threshold |
+| Stage 3 — exact-name gate + ambiguity guard | require exact first+last; ≥2 distinct exact-name persons → review |
+| Stage 4 — agency validation | deterministic non-LE guard (DA/Coroner/… ✗ LE) then LLM agency-equivalence check |
 
-Employment records contain the following structured fields:
+The county / agency_type filters are **optional** — used when the data has them (the rich CA
+data), silently skipped otherwise (the lean all-states data). Same code, both regimes.
 
-- **post_person_nbr**: Unique POST identifier
-- **post_first_name**: Officer's first name
-- **post_middle_name**: Officer's middle name
-- **post_last_name**: Officer's last name
-- **post_suffix**: Name suffix (Jr., Sr., etc.)
-- **post_agency_name**: Name of employing agency
-- **post_agency_type**: Type of agency (typically "POLICE")
-- **post_start_date**: Employment start date
-- **post_end_date**: Employment end date (null if current)
-- **post_separation_reason**: Reason for separation if applicable
-- **post_state**: Reason for separation if applicable
+**Gate visibility.** Every result records which gates fired. `MentionResult` carries a `gates`
+checklist (mention-level stages: state, common-name, same-name-in-state, candidates-found,
+exact-name, ambiguity, agency) and `ambiguous`, and each entry in `candidates` is annotated with
+`above_threshold`, `exact_name`, `is_best`, `agency_valid`. `resolve.explain.gate_sections()`
+groups candidates by how many gates they cleared (most-central = passed all = the auto-match).
 
-## Project Structure
+## Interactive TUI
 
-```
-api/
-├── server/             # legacy CA `postie` API (port 8000)
-│   ├── src.py          # FastAPI server
-│   └── config.py       # Configuration settings
-├── server_all_states/  # all-states API over `all_npi_states` (port 8001)
-├── etl/                # NPI Firestore → Supabase sync (all-states)
-├── database/
-│   └── src.py          # Database client
-├── test/
-│   └── src.py          # API test script
-├── resolve/
-│   ├── src/
-│   │   ├── match.py             # legacy CA entity-resolution pipeline
-│   │   ├── match_all_states.py  # all-states entity-resolution pipeline
-│   │   ├── explore_tui.py       # interactive TUI (search + run pipeline by hand)
-│   │   ├── pipeline_runner.py   # isolated-subprocess pipeline runner used by the TUI
-│   │   └── api.py               # API client (base URL from NPI_API_URL)
-│   └── data/
-│       ├── input/      # Input data for matching
-│       └── output/     # Matching results
-└── .env                # Environment variables
-```
-
-## Entity Resolution Pipeline
-
-The API supports an entity resolution pipeline for matching officer mentions to POST employment records:
+`tools/explore_tui.py` — **Search** mode (direct API queries) and **Pipeline** mode (runs the
+real `resolve` pipeline on one mention). Pipeline mode renders each candidate as a row with
+**per-gate columns** (`common · uniq · thr · exact · ambig · best · agency`; ✓ passed / ⚑ flagged
+/ ✗ failed / · n/a), best-first. Early-stop cases (e.g. common surname) show one mention row with
+the flagged gate.
 
 ```bash
-# Run entity resolution
-cd resolve/src
-python3 match.py
+venv/bin/python run.py api                                          # :8001 (terminal 1)
+NPI_API_URL=http://localhost:8001 venv/bin/python tools/explore_tui.py   # (terminal 2)
 ```
 
-The pipeline:
-1. Reads officer mentions from input CSV
-2. Fetches targeted POST employment records by last name (efficient API usage)
-3. Applies machine learning models to match mentions to employment records
-4. Outputs matched results with confidence scores
-
-## Documentation
-
-- **API Documentation**: Available at `http://localhost:8000/docs` when server is running
-- **OpenAPI Schema**: Available at `http://localhost:8000/openapi.json`
-
-## Requirements
-
-- Python 3.7+
-- FastAPI
-- Supabase account and API key
-- pandas (for entity resolution)
-- scikit-learn (for entity resolution models)
-
-## Testing the API
-
-Run the comprehensive test script:
+## Testing
 
 ```bash
-cd test
-python3 src.py
+venv/bin/python -m pytest                    # fast unit suite (no network)
+venv/bin/python -m pytest -m integration     # opt-in: hits live Supabase / API / LLM
 ```
 
-The test script will:
-- Verify API health check
-- Test employment record search functionality
-- Check employment count endpoint
-- Display database statistics
-- Test specific officer searches
+Integration tests skip cleanly when the API isn't reachable. Parity tests (`test_parity.py`)
+compare the all-states API against the legacy postie API when both are up.
 
-## Troubleshooting
+## API endpoints
 
-**Server won't start**: Check that your `.env` file contains a valid `SUPABASE_KEY`
+`GET /post/employment` · `GET /post/employment/count` · `GET /post/candidates` ·
+`GET /post/officers/by-name` (optional `state`) · `GET /post/agency/county` (null for
+all-states) · `GET /post/stats` · batch variants under `/post/.../batch`.
 
-**Search tool connection error**: Ensure the API server is running on `http://localhost:8000`
+## Environment
 
-**No search results**: Try partial names or different spelling variations
+| var | purpose |
+|---|---|
+| `NPI_API_URL` | which API the resolve pipeline hits (default `http://localhost:8000`; use `:8001`) |
+| `NPI_ALL_STATES_PORT` | API port (default 8001) |
+| `OPENAI_API_KEY` | agency-validation LLM (in `resolve/.env`) |
+| `SUPABASE_KEY` | Supabase REST key (in a discoverable `.env`) |
+| `DEFAULT_STATE` | fallback state for CSV inputs without a `state` column |
 
-**Entity resolution performance**: The pipeline fetches only relevant records by last name and state, if provided
+## Legacy CA stack
 
-## Example API Response
-
-```json
-[
-  {
-    "post_person_nbr": "B01-Y73",
-    "post_first_name": "John",
-    "post_middle_name": "A",
-    "post_last_name": "Smith",
-    "post_suffix": "",
-    "post_agency_name": "LOS ANGELES POLICE DEPARTMENT",
-    "post_agency_type": "POLICE",
-    "post_start_date": "2003-06-30",
-    "post_end_date": "2024-09-19",
-    "post_separation_reason": "Retired",
-    "post_state": "CA"
-  }
-]
-```
+The original California-only `postie` stack (`server/`, `database/`, the old `match.py`) has
+been superseded by the all-states stack and moved to `archive/legacy_ca/` (validated head-to-head:
+0 false positives, equal/better recall — see `plans/` and PIPELINE.md). It is kept for reference
+only and is not part of the active build.

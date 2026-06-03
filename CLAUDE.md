@@ -12,75 +12,94 @@ The system consists of:
 3. **Supabase database** - PostgreSQL backend storing employment records
 4. **Rust feature extraction** (optional) - Performance-optimized string similarity calculations
 
-### Two stacks — read [PIPELINE.md](./PIPELINE.md) first
+### One consolidated stack (2026-06 refactor) — read [PIPELINE.md](./PIPELINE.md)
 
-There are now **two parallel stacks**. The all-states one is the current/general flow:
+The repo was consolidated onto a **single, API-centric stack**. The legacy CA `postie` stack was
+archived to `archive/legacy_ca/` (gitignored). Current layout:
 
-| | **All-states (current, general)** | **Legacy CA (`postie`)** |
-|---|---|---|
-| Table | `all_npi_states` (~3.7M rows, ~24 states; synced from NPI Firestore) | `postie` (CA only, manually populated) |
-| API | `server_all_states/` (port **8001**) | `server/` (port **8000**) |
-| Pipeline | `resolve/src/match_all_states.py` (no county/agency_type) | `resolve/src/match.py` |
-| Sync | `etl/` (Firestore → Supabase, full + incremental) | manual CSV upload |
+| | **Current (all-states)** |
+|---|---|
+| Table | `all_npi_states` (~3.7M rows, ~24 states; synced from NPI Firestore) |
+| API | `api/` (FastAPI, port **8001**) — `app.py`, `database.py` (AllStatesClient), `config.py` |
+| Pipeline | `resolve/` package — `pipeline.py` (`PostMatcher`), `candidates.py`, `scoring.py`, `validation.py`, `agency.py`, `client.py`, `io.py`, `cli.py` |
+| Models | `shared/models.py` (Pydantic) ; `shared/env.py` (.env discovery) |
+| Sync | `etl/` (Firestore → Supabase, full + incremental) |
+| Tools | `tools/explore_tui.py`, `tools/pipeline_runner.py` |
+| Launcher | `run.py` (`python run.py api` / `venv/bin/python run.py resolve …`) |
 
-The pipeline picks a stack via the **`NPI_API_URL`** env var. **[PIPELINE.md](./PIPELINE.md)
-documents the entire general flow** (fetch → sync → serve → entity resolution) for any person in
-any state — start there. Most sections below describe the legacy CA stack unless noted.
+**The CA-specific richness (county filter, agency_type mask) is preserved but OPTIONAL** in the
+consolidated `resolve.candidates.select_candidates` — applied when the data has it, skipped when
+it doesn't. The pipeline points at an API via **`NPI_API_URL`**. Legacy CA code lives in
+`archive/legacy_ca/` for reference only. **[PIPELINE.md](./PIPELINE.md)** documents the full flow.
 
 ## Development Commands
 
 ### Starting the API Server
 
 ```bash
-cd server
-python3 src.py
+venv/bin/python run.py api       # :8001
+# docs at http://localhost:8001/docs
 ```
 
-The API will be available at `http://localhost:8000`. View API docs at `http://localhost:8000/docs`.
+**Use `venv/bin/python` for everything** (API + pipeline). The venv now has
+fastapi/uvicorn/supabase *and* the ML deps, with **no tensorflow** — so it avoids the
+`sentence-transformers` import-deadlock that the global Python (which has tensorflow) triggers.
+Do not run any component with the global Python.
 
-### Running Entity Resolution Pipeline
+### Running the Entity Resolution Pipeline
+
+The API must be running first.
 
 ```bash
-cd resolve/src
-../../venv/bin/python match.py
+# from a CSV (batch)
+venv/bin/python run.py resolve from-csv \
+    --input resolve/data/input/involved_officers_2-2-2026.csv \
+    --api http://localhost:8001 --default-state CA \
+    --output-dir resolve/data/output/all_states [--sample-n 100 --sample-seed 42]
+
+# from a name (single; candidates fetched from the API)
+venv/bin/python run.py resolve from-name \
+    --first Scott --last Lunger --state CA --year 2015 \
+    --source-agency "Hayward Police Department" --api http://localhost:8001
 ```
 
-**Important**: The API server must be running before executing the matching pipeline. Run the pipeline from the project venv (see Interpreter note under Dependencies).
+`--default-state` supplies a fallback for inputs lacking a `state` column. Outputs:
+`auto_matched.jsonl`, `early_filtered.jsonl`, `failed_entity_resolution.jsonl`, `results.csv`.
 
-### All-states stack (current / general — see PIPELINE.md)
+As a library: `from resolve import PostMatcher, build_mention` → `matcher.resolve_one(...)` /
+`resolve_batch(...)`. `PostMatcher(client=…, scorer=…, validator=…)` are injectable for testing.
+
+### Syncing the data
 
 ```bash
-# 1. Sync NPI Firestore -> Supabase table `all_npi_states`
 venv/bin/python etl/sync_firestore.py            # full reload (bootstrap/rebuild)
 venv/bin/python etl/sync_incremental.py          # per-state incremental (cron-friendly)
-
-# 2. Serve all_npi_states (isolated API on :8001; postie's :8000 untouched)
-cd server_all_states && python3 src.py
-
-# 3. Run entity resolution against it (county/agency_type not needed; works for any state)
-cd resolve/src && NPI_API_URL=http://localhost:8001 DEFAULT_STATE=CA ../../venv/bin/python match_all_states.py
 ```
 
-`DEFAULT_STATE` supplies a fallback state for inputs lacking a `state` column; `SAMPLE_N` /
-`SAMPLE_SEED` give reproducible sample runs (also added to `match.py`). Outputs go to
-`resolve/data/output/all_states/` (the postie pipeline's outputs are never touched).
-
-### Interactive TUI for the all-states stack (manual exploration)
-
-`resolve/src/explore_tui.py` is a Textual TUI to poke at the all-states stack by hand — a
-**Search** mode (direct API queries) and a **Pipeline** mode (runs the real entity resolution on
-one typed-in mention and shows the verdict + candidates + log). See README.md for usage.
+### Running tests
 
 ```bash
-cd server_all_states && python3 src.py                                          # API on :8001
-cd resolve/src && NPI_API_URL=http://localhost:8001 ../../venv/bin/python explore_tui.py
+venv/bin/python -m pytest                    # fast unit suite (no network)
+venv/bin/python -m pytest -m integration     # opt-in: live Supabase / API / LLM (skips if down)
 ```
 
-Run it **under the venv from `resolve/src`** (pipeline mode imports `sentence_transformers` and
-reads model/CSV by relative path; needs `OPENAI_API_KEY` in `resolve/src/.env`). Pipeline mode
-runs each request in an isolated subprocess (`pipeline_runner.py`) so the heavy library output is
-captured to the log pane instead of corrupting the terminal. The incident year must fall within
-the officer's years of service (candidates are filtered to incident year ± 1).
+### Interactive TUI (manual exploration)
+
+`tools/explore_tui.py` — **Search** mode (direct API queries) and **Pipeline** mode (runs the real
+`resolve` pipeline on one typed-in mention via `tools/pipeline_runner.py`, an isolated subprocess
+so heavy library output goes to the log pane, not the terminal). Pipeline mode renders each
+candidate as a row with **per-gate columns** (`common · uniq · thr · exact · ambig · best ·
+agency`; ✓ passed / ⚑ flagged / ✗ failed / · n/a), best-first; early-stop cases show one mention
+row with the flagged gate.
+
+```bash
+venv/bin/python run.py api                                          # :8001
+NPI_API_URL=http://localhost:8001 venv/bin/python tools/explore_tui.py
+```
+
+Run the TUI under the venv (pipeline mode imports `sentence_transformers`; needs `OPENAI_API_KEY`
+in `resolve/.env`). The incident year must fall within the officer's years of service (candidates
+are filtered to incident year ± 1).
 
 ### Building Rust Components (Optional)
 
@@ -103,34 +122,32 @@ python3 src.py
 
 ```
 api/
-├── PIPELINE.md      # ★ general all-states flow (fetch → sync → serve → resolve)
-├── etl/             # NPI Firestore → Supabase sync (all-states stack)
-│   ├── sync_firestore.py    # full reload → table `all_npi_states`
-│   ├── sync_incremental.py  # per-state incremental sync (cron)
-│   └── common.py            # shared Firestore + Postgres helpers
-├── server/          # FastAPI application (legacy CA / postie, port 8000)
-│   ├── src.py      # API endpoints
-│   └── config.py   # Configuration (Supabase URL/key)
-├── server_all_states/  # Isolated API over all_npi_states (port 8001)
-│   ├── src.py      # endpoints (mirrors postie contract)
-│   ├── database.py # AllStatesClient (case-insensitive, state code↔name, no county/agency_type)
+├── PIPELINE.md      # ★ all-states flow (fetch → sync → serve → resolve)
+├── run.py           # launcher: `python run.py api` | `venv/bin/python run.py resolve …`
+├── api/             # FastAPI app over all_npi_states (port 8001)
+│   ├── app.py       # endpoints
+│   ├── database.py  # AllStatesClient (case-insensitive, state code↔name, no county/agency_type)
 │   └── config.py
-├── database/        # Supabase client wrapper (postie)
-│   └── src.py      # Query methods for POST data
-├── models/          # Pydantic models (shared by both stacks)
-│   └── src.py      # Data schemas
-├── resolve/         # Entity resolution pipeline
-│   └── src/
-│       ├── match.py            # legacy CA pipeline (postie, county + agency_type)
-│       ├── match_all_states.py # all-states pipeline (no county/agency_type, any state)
-│       ├── explore_tui.py      # interactive TUI: search the API or run the pipeline by hand
-│       ├── pipeline_runner.py  # isolated-subprocess pipeline runner used by explore_tui.py
-│       ├── api.py       # API client (base URL from NPI_API_URL env)
-│       ├── features.py  # Feature engineering
-│       ├── helpers.py   # Validation utilities (validate_agency_match: non-LE guard + LLM)
-│       └── llm.py       # LLM-assisted agency validation (OpenAI, gpt-5.4-nano)
-└── src/             # Rust performance optimizations
-    └── main.rs      # String similarity functions
+├── resolve/         # entity-resolution library + CLI
+│   ├── pipeline.py  # PostMatcher (resolve_one/resolve_batch) + stage logic; injectable deps
+│   ├── candidates.py# date/name/county/agency_type filters — county+agency_type OPTIONAL
+│   ├── scoring.py   # XGBoost scorer (make_scorer; model+featurize injectable)
+│   ├── features.py  # feature engineering (package-relative scaler path)
+│   ├── agency.py    # deterministic non-LE guard (import-clean, no LLM)
+│   ├── validation.py# agency validation: guard + LLM (injectable llm_fn)
+│   ├── llm.py       # OpenAI wrapper, lazy client (gpt-5.4-nano)
+│   ├── client.py    # NPIClient (base URL from NPI_API_URL)
+│   ├── explain.py   # gate_sections() — group annotated candidates by gates cleared
+│   ├── io.py        # CSV read, build_mention, write_outputs, common-name loader
+│   ├── cli.py       # `from-csv` / `from-name` subcommands
+│   └── data/, models/  # inputs + pickled XGBoost / scaler
+├── shared/          # models.py (Pydantic) · env.py (.env discovery)
+├── etl/             # Firestore → Supabase sync (sync_firestore / sync_incremental / common)
+├── tools/           # explore_tui.py · pipeline_runner.py (manual exploration)
+├── tests/           # pytest suite (unit + opt-in integration)
+├── notebooks/       # EDA / scratch
+├── archive/legacy_ca/  # deprecated CA `postie` stack (server/, database/, models/, resolve_src/, test/)
+└── src/             # Rust performance optimizations (optional)
 ```
 
 ### Key Data Models
