@@ -18,3 +18,8 @@ CLAUDE.md
 *.log
 *.md
 archive/
+resolve_archive/
+llm-responses.cache/
+# Firestore service-account creds (do not commit)
+firestore/serviceAccountKey.json
+etl/.sync_checkpoint

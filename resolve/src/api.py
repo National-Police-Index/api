@@ -17,7 +17,10 @@ logger = logging.getLogger(__name__)
 class NPIClient:
     """POST Employment API Client with Pydantic model support"""
 
-    def __init__(self, base_url: str = "http://localhost:8000", timeout: int = 180):
+    def __init__(self, base_url: str = None, timeout: int = 180):
+        # Default to NPI_API_URL env var so the pipeline can switch between the
+        # postie server (8000) and the all_npi_states server (8001) with no code change.
+        base_url = base_url or os.environ.get("NPI_API_URL", "http://localhost:8000")
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self.session = requests.Session()
@@ -234,18 +237,21 @@ class NPIClient:
             return None
         
     def get_officers_by_name(
-    self, 
-    first_name: str, 
-    last_name: str
+    self,
+    first_name: str,
+    last_name: str,
+    state: str = None
 ) -> List[PostEmploymentRecord]:
         """
-        Get all officers with matching first/last name across the entire database.
+        Get all officers with matching first/last name.
         Returns all records regardless of middle name, suffix, or agency.
-        
+
         Args:
             first_name: Officer first name
             last_name: Officer last name
-            
+            state: Optional state filter (scopes same-name ambiguity to one state).
+                   Ignored by servers that don't support it (e.g. the postie server).
+
         Returns:
             List of PostEmploymentRecord models
         """
@@ -254,6 +260,8 @@ class NPIClient:
                 "first_name": first_name,
                 "last_name": last_name
             }
+            if state:
+                params["state"] = state
             
             response = self.session.get(
                 f"{self.base_url}/post/officers/by-name",
