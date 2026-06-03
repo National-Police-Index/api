@@ -29,8 +29,6 @@ Pipeline mode also needs OPENAI_API_KEY in resolve/src/.env (agency validation L
 """
 import os
 import sys
-import contextlib
-import datetime
 
 # Make sibling modules (api, features, helpers) and the repo root (models.src) importable
 # regardless of cwd, and pin cwd to this dir so the pipeline's relative paths resolve.
@@ -336,48 +334,54 @@ class PipelineScreen(Screen):
         )
 
     def _run_pipeline(self, first, last, middle, state, year, agency, mentioned):
-        # Imported lazily: pulls in features.py -> sentence_transformers (heavy).
-        from models.src import OfficerMention
-        from match_all_states import PostMatcher
+        # Run the pipeline in a SEPARATE PROCESS (pipeline_runner.py). This isolates ALL of
+        # its output — including the fd-level writes from torch/transformers/tqdm/warnings —
+        # into a captured log file, so none of it can bleed onto the Textual terminal.
         import hashlib
+        import json
         import tempfile
+        import subprocess
 
         uid = hashlib.sha256(f"{first}|{last}|{state}|{year}|{agency}".encode()).hexdigest()[:16]
-        mention = OfficerMention(
-            mention_uid=uid,
-            mention_agency_type="POLICE",
-            mention_incident_date=datetime.date(year, 1, 1),
-            mention_first_name=first.upper(),
-            mention_middle_name=middle.upper() or None,
-            mention_last_name=last.upper(),
-            mention_agency=agency or None,
-            state=state,
-            mentioned_agencies=mentioned or "",
-        )
+        mention = {
+            "uid": uid, "first": first, "last": last, "middle": middle,
+            "state": state, "year": year, "agency": agency, "mentioned": mentioned,
+        }
+        in_f = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
+        json.dump(mention, in_f); in_f.close()
+        out_path = in_f.name + ".out"
+        log_path = in_f.name + ".log"
 
-        # find_canonical_stint prints heavy debug; capture to a REAL temp file (not StringIO —
-        # huggingface spawns subprocesses needing stdout.fileno(), which StringIO lacks).
-        log = ""
-        tmp = tempfile.NamedTemporaryFile("w+", suffix=".log", delete=False)
         try:
-            with contextlib.redirect_stdout(tmp), contextlib.redirect_stderr(tmp):
-                matcher = PostMatcher()
-                matched, all_cands, invalid, _hist = matcher.find_canonical_stint([mention])
-            tmp.flush(); tmp.seek(0); log = tmp.read()
-            self.app.call_from_thread(self._show_pipeline, uid, matched, all_cands, invalid, log, None)
+            with open(log_path, "w") as logf:
+                proc = subprocess.run(
+                    [sys.executable, os.path.join(_HERE, "pipeline_runner.py"), in_f.name, out_path],
+                    cwd=_HERE, env=os.environ.copy(),
+                    stdout=logf, stderr=subprocess.STDOUT, timeout=180,
+                )
+            log = _read(log_path)
+            if proc.returncode != 0 or not os.path.exists(out_path):
+                tail = "\n".join(log.splitlines()[-8:])
+                self.app.call_from_thread(
+                    self._show_pipeline, None, log,
+                    f"pipeline exited with code {proc.returncode}. {tail}")
+                return
+            with open(out_path) as f:
+                result = json.load(f)
+            self.app.call_from_thread(self._show_pipeline, result, log, None)
+        except subprocess.TimeoutExpired:
+            self.app.call_from_thread(self._show_pipeline, None, _read(log_path),
+                                      "pipeline timed out after 180s")
         except Exception as e:  # noqa: BLE001
-            try:
-                tmp.flush(); tmp.seek(0); log = tmp.read()
-            except Exception:
-                pass
-            self.app.call_from_thread(self._show_pipeline, uid, None, None, None, log, str(e))
+            self.app.call_from_thread(self._show_pipeline, None, _read(log_path), str(e))
         finally:
-            try:
-                tmp.close(); os.unlink(tmp.name)
-            except Exception:
-                pass
+            for p in (in_f.name, out_path, log_path):
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
 
-    def _show_pipeline(self, uid, matched, all_cands, invalid, log, err):
+    def _show_pipeline(self, result, log, err):
         rlog = self.query_one("#log", RichLog)
         if log:
             rlog.write(log[-8000:])
@@ -386,39 +390,28 @@ class PipelineScreen(Screen):
             self._verdict(f"[red]Pipeline error: {err}[/red]")
             return
 
-        auto = matched is not None and len(matched) > 0
-        if auto:
-            row = matched.iloc[0]
+        matched = result.get("matched") or []
+        if matched:
+            m = matched[0]
             self._verdict(
-                f"[b green]AUTO-MATCHED[/b green] → {row.post_first_name} {row.post_last_name} "
-                f"| {row.post_agency_name} | POST {row.post_person_nbr} "
-                f"| prob {float(row.match_probability):.3f}"
+                f"[b green]AUTO-MATCHED[/b green] → {m['post_first_name']} {m['post_last_name']} "
+                f"| {m['post_agency_name']} | POST {m['post_person_nbr']} "
+                f"| prob {m['match_probability']:.3f}"
             )
         else:
-            reason = "No candidates found"
-            if invalid is not None and len(invalid) > 0:
-                rmatch = invalid[invalid["mention_uid"] == uid]
-                if len(rmatch) > 0:
-                    reason = str(rmatch.iloc[0].get("validation_reason", reason))
-            self._verdict(f"[b yellow]ROUTED TO REVIEW[/b yellow] — {reason}")
+            self._verdict(f"[b yellow]ROUTED TO REVIEW[/b yellow] — {result.get('reason') or 'No match'}")
 
         t = self.query_one("#cands", DataTable)
         t.clear()
-        added = 0
-        if all_cands is not None and len(all_cands) > 0:
-            cc = all_cands[all_cands["mention_uid"] == uid] if "mention_uid" in all_cands else all_cands
-            if "match_probability" in cc:
-                cc = cc.sort_values("match_probability", ascending=False)
-            for _, c in cc.iterrows():
-                prob = c.get("match_probability")
-                t.add_row(
-                    str(c.get("post_person_nbr", "")), str(c.get("post_first_name", "")),
-                    str(c.get("post_last_name", "")), str(c.get("post_agency_name", "")),
-                    _d(c.get("post_start_date")), _d(c.get("post_end_date")),
-                    f"{float(prob):.3f}" if prob is not None else "",
-                )
-                added += 1
-        if added:
+        cands = result.get("candidates") or []
+        for c in cands:
+            prob = c.get("match_probability")
+            t.add_row(
+                c["post_person_nbr"], c["post_first_name"], c["post_last_name"],
+                c["post_agency_name"], c["post_start_date"], c["post_end_date"],
+                f"{prob:.3f}" if prob is not None else "",
+            )
+        if cands:
             t.focus()  # focused => arrow keys scroll the candidates table
 
     def _verdict(self, msg: str) -> None:
@@ -431,6 +424,14 @@ def _d(v):
         return ""
     s = str(v)
     return s[:10] if s and s != "NaT" else ""
+
+
+def _read(path):
+    try:
+        with open(path) as f:
+            return f.read()
+    except OSError:
+        return ""
 
 
 class ExploreApp(App):
