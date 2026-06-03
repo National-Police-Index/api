@@ -2,6 +2,56 @@
 
 A REST API and interactive search tool for accessing POST (Peace Officer Standards and Training) officer employment records through the National Police Index. D
 
+> **📄 New: all-states flow.** The current, general pipeline syncs the NPI's live Firestore into
+> Supabase (`all_npi_states`, ~24 states) and resolves any officer in **any state** — no
+> California-specific assumptions, no `county`/`agency_type` required. See **[PIPELINE.md](./PIPELINE.md)**
+> for the full flow (fetch → sync → serve → entity resolution).
+>
+> The Quick Start below covers the **legacy CA `postie`** API (port 8000). The all-states stack
+> lives in `etl/` (Firestore sync), `server_all_states/` (API on port 8001), and
+> `resolve/src/match_all_states.py` (pipeline). Switch the pipeline between them with the
+> `NPI_API_URL` env var.
+
+## Interactive explorer (TUI)
+
+`resolve/src/explore_tui.py` is a terminal UI for **playing with the all-states stack** by hand.
+It has two modes:
+
+- **Search** — query the API directly (employment search by name/state/agency, or "all officers
+  by name" to see same-name ambiguity).
+- **Pipeline** — run the **real** entity-resolution pipeline on one mention you type in
+  (Stage 0 early-filter → candidate generation → XGBoost scoring → exact-name gate →
+  agency validation) and see the verdict (AUTO-MATCHED vs ROUTED TO REVIEW + reason), the
+  scored candidates, and the full pipeline log.
+
+### Run it
+
+```bash
+# 1. start the all-states API (separate terminal) — uses the global python that has fastapi
+cd server_all_states && /Users/ayyubibrahim/bin/python3 src.py        # :8001
+
+# 2. run the TUI from resolve/src, under the VENV, pointed at that API
+cd resolve/src && NPI_API_URL=http://localhost:8001 ../../venv/bin/python explore_tui.py
+```
+
+**It must run under the venv and from `resolve/src`** — pipeline mode imports
+`sentence_transformers` (which deadlocks under the global Python that has TensorFlow), and the
+pipeline reads its model/CSV by relative path. Pipeline mode also needs `OPENAI_API_KEY` in
+`resolve/src/.env` (agency validation).
+
+### Using it
+
+- Press **S** for Search, **P** for Pipeline; **Esc** goes back, **Ctrl+F** jumps back to the
+  form to edit, **q** quits (and **Ctrl+C** always quits, even mid-typing).
+- Results land in a table that's focused automatically — **↑/↓** scroll, **PgUp/PgDn** page,
+  **Ctrl+Home/Ctrl+End** jump to top/bottom.
+- **Pipeline mode caveats:** name + state + incident year are required, and the **incident year
+  must fall within the officer's years of service** (candidates are filtered to incident year
+  ± 1). A run takes ~15–30s because it loads the model in an isolated subprocess (this keeps the
+  heavy library output from bleeding onto the screen).
+- **Verified example:** First `Scott`, Last `Lunger`, State `CA`, Year `2015`, Source agency
+  `Hayward Police Department` → auto-matches to POST `b04-j30`.
+
 ## Quick Start
 
 ### 1. Setup Environment
@@ -113,19 +163,22 @@ Employment records contain the following structured fields:
 
 ```
 api/
-├── server/
+├── server/             # legacy CA `postie` API (port 8000)
 │   ├── src.py          # FastAPI server
 │   └── config.py       # Configuration settings
-├── search/
-│   └── src.py          # Interactive search tool
+├── server_all_states/  # all-states API over `all_npi_states` (port 8001)
+├── etl/                # NPI Firestore → Supabase sync (all-states)
 ├── database/
 │   └── src.py          # Database client
 ├── test/
 │   └── src.py          # API test script
 ├── resolve/
 │   ├── src/
-│   │   ├── match.py    # Entity resolution pipeline
-│   │   └── api.py      # API client for entity resolution
+│   │   ├── match.py             # legacy CA entity-resolution pipeline
+│   │   ├── match_all_states.py  # all-states entity-resolution pipeline
+│   │   ├── explore_tui.py       # interactive TUI (search + run pipeline by hand)
+│   │   ├── pipeline_runner.py   # isolated-subprocess pipeline runner used by the TUI
+│   │   └── api.py               # API client (base URL from NPI_API_URL)
 │   └── data/
 │       ├── input/      # Input data for matching
 │       └── output/     # Matching results
